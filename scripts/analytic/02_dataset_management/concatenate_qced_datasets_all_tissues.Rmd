@@ -1,0 +1,246 @@
+---
+title: "merge_datasets"
+author: "Kyle Abraham Campbell"
+date: "2023-11-13"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+library(here)
+library(minfi)
+library(Seurat)
+library(tidyverse)
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Merge all datasets for deconvolution reference
+```{r}
+# Common covariates between the datasets
+clin.covariates <- c("Sample.ID", "Sex", "CellType", "Case_ID", "Study", "Sentrix_ID", "Sentrix_Position"
+)
+
+kc <- readRDS(here("data", "analytic", "campbell", paste0("qc_beta_bmiq_campbell_2023-11-13.rda")))
+kc.pd <- readRDS(here("data", "analytic", "campbell", "pd_kc_harmonized_2023-11-13.rda"))
+colnames(kc) <- kc.pd$Sample.ID
+
+
+vy <- readRDS(here("data", "analytic", "yuan", paste0("beta_bmiq_qced_yuan_2023-11-14.rda")))
+vy.pd <- readRDS(here("data", "analytic", "yuan", paste0("beta_bmiq_qced_yuan_pd_2023-11-14.rda"))) %>% 
+  dplyr::select(clin.covariates)
+colnames(vy) <- vy.pd$Sample.ID
+
+blood <- readRDS(here("data", "analytic", "blood", paste0("qc_beta_bmiq_blood_2023-11-16.rda")))
+blood.pd <- readRDS(here("data", "analytic", "blood", paste0("qc_pd_blood_2023-11-16.rda")))
+colnames(blood) <- blood.pd$Sample.ID
+
+nrbc.bakulski <- readRDS(here("data", "analytic", "nrbc", "beta_noob_bmiq_nrbc_qc_Bakulski_2023-11-15.rda"))
+nrbc.bakulski.pd <-readRDS(here("data", "analytic", "nrbc", "bakulski_nrbc_pd_2023-11-16.rda")) %>%
+  dplyr::select(clin.covariates)
+colnames(nrbc.bakulski) <- nrbc.bakulski.pd$Sample.ID
+
+nrbc.degoede <- readRDS(file = here("data", "analytic", "nrbc", "beta_noob_bmiq_nrbc_qc_deGoede_2023-11-15.rda"))
+nrbc.degoede.pd <- readRDS(file = here("data", "analytic", "nrbc", "deGoede_nrbc_pd_2023-11-16.rda")) %>%
+  dplyr::select(clin.covariates) %>%
+  mutate(Study = "de Goede")
+colnames(nrbc.degoede) <- nrbc.degoede.pd$Sample.ID
+```
+
+```{r}
+pd <- rbind(kc.pd, vy.pd, blood.pd, nrbc.bakulski.pd, nrbc.degoede.pd)
+rownames(pd) <- pd$Sample.ID
+```
+
+
+## Find common probes
+368435 common probes between all datasets
+```{r}
+common.probes <- Reduce(intersect, list(rownames(kc), rownames(vy), rownames(blood), rownames(nrbc.bakulski), rownames(nrbc.degoede)))
+length(common.probes)
+```
+
+## Concatenate
+```{r}
+beta.list <- 
+  list(
+    kc, vy, blood, nrbc.bakulski, nrbc.degoede
+  )
+# Subset each to common probes
+beta.list.overlap <- map(beta.list, .f = ~ .x[rownames(.x) %in% common.probes,])
+
+beta.concat <- do.call("cbind", beta.list.overlap)
+```
+
+Exploratory CpG plots; an example showing the 4 ST samples we kept appear very specific, in addition to the stromal we left out. cg01802953 was very low in CT/ST and around those tight cluster in nRBC/stromal in the final analytic sample
+```{r}
+plotCpg(dat = beta.concat, pheno = pd$CellType, type = "categorical", cpg = "cg01802953")
+```
+
+
+## Subset to keep based on placental cell type clustering 
+```{r}
+keep.ids <- readRDS(here("data", "analytic", "campbell_yuan_concat", "strict_keep_2023-11-15.rda"))
+
+drop.ids <- pd %>%
+  filter(Study %in% c("Campbell", "Yuan")) %>%
+  filter(!Sample.ID %in% keep.ids) %>%
+  pull(Sample.ID)
+length(drop.ids)
+
+pd.keep <- pd %>%
+  filter(!Sample.ID %in% drop.ids)
+
+pd.drop <- pd %>%
+  filter(Sample.ID %in% drop.ids)
+
+beta.concat.keep <- beta.concat[,colnames(beta.concat) %in% pd.keep$Sample.ID]
+
+levels(pd.keep$CellType) <- c("Whole tissue", "B cell", "CD4T", "CD8T", "Cytotrophoblast", "Endothelial", 
+"Hofbauer", "Monocyte", "Neutrophil", "Natural Killer", "Nucleated red blood cell", "Stromal", "Syncytiotrophoblast"
+)
+```
+
+Take a look at excluded samples
+```{r}
+pd.dropped <- pd %>%
+  filter(Study %in% c("Campbell", "Yuan")) %>%
+  filter(!Sample.ID %in% keep.ids)
+```
+
+
+## Save
+```{r, eval = F}
+saveRDS(pd.keep, here("data", "analytic", "concat", "pd_2023-11-30.rda"))
+saveRDS(beta.concat.keep, here("data", "analytic", "concat", "beta_2023-11-16.rda"))
+```
+
+```{r}
+pd <- readRDS(here("data", "analytic", "concat", "pd_2023-11-30.rda"))
+beta <- readRDS(here("data", "analytic", "concat", "beta_2023-11-16.rda"))
+```
+
+## Visualize
+
+Seurat pipeline
+```{r}
+pipe.fast.seu <- function(seu) {
+  seu <- ScaleData(seu, do.scale = F, do.center = F)
+  seu <- RunPCA(seu, features = rownames(seu))
+  seu <- FindNeighbors(object = seu)
+  seu <- FindClusters(object = seu)
+  seu <- RunUMAP(seu, dims = 1:30)
+  return(seu)
+}
+```
+
+```{r}
+seu <- CreateSeuratObject(counts = beta, meta.data = pd, data = beta)
+
+# Not sure why the data step is there
+#seu <- CreateSeuratObject(counts = beta, data = beta.placenta, meta.data = pd)
+```
+
+```{r}
+seu <- pipe.fast.seu(seu)
+```
+
+Get PCA variance explained
+```{r}
+pca = seu@reductions$pca
+eigValues = (pca@stdev)^2  ## EigenValues
+varExplained = eigValues / sum(eigValues)
+print(varExplained[1:5])
+```
+
+```{r}
+levels(seu@meta.data$CellType) <- c("B cell", "CD4T", "CD8T", "Cytotrophoblast", "Endothelial", "Hofbauer", "Monocyte", "Neutrophil", "Natural Killer", "nRBC", "Stromal", "Syncytiotrophoblast", "Whole tissue")
+seu.dat <- seu@meta.data
+
+#seu.dat$CellType <- factor(seu.dat$CellType, levels = c("Cytotrophoblast", "Endothelial", "Hofbauer", "Stromal", "Syncytiotrophoblast", "Villi"))
+seu.dat$UMAP_1 <- seu@reductions$umap@cell.embeddings %>% as.data.frame() %>% pull(umap_1)
+seu.dat$UMAP_2 <- seu@reductions$umap@cell.embeddings %>% as.data.frame() %>% pull(umap_2)
+seu.dat$PC_1 <- seu@reductions$pca@cell.embeddings %>% as.data.frame() %>% pull(PC_1)
+seu.dat$PC_2 <- seu@reductions$pca@cell.embeddings %>% as.data.frame() %>% pull(PC_2)
+```
+
+```{r}
+DimPlot(seu, label = T, repel = T, reduction = "pca", group.by = "CellType") + NoLegend()
+```
+
+```{r}
+levels(seu@meta.data$CellType)
+```
+
+```{r}
+seu@meta.data$CellType <- factor(seu@meta.data$CellType)
+levels(seu@meta.data$CellType)
+levels(seu@meta.data$CellType) <- c("B cell", "CD4T", "CD8T", "Cytotrophoblast", "Endothelial", "Hofbauer", "Monocyte", "Neutrophil", "Natural Killer", "Nucleated red blood cell", "Stromal", "Syncytiotrophoblast", "Whole tissue")
+```
+
+```{r}
+colors.13 <- c(
+"#8DD3C7", "#FFFFB3", "#BEBADA",
+"#FB8072", "#80B1D3", "#FDB462", 
+"#B3DE69", "#FCCDE5", "#FDB462",
+"#BC80BD", "#CCEBC5", "#8DD3C7",
+"#BC80BD"
+)
+custom_palette <- colorRampPalette(brewer.pal(12, "Set3"))(13)
+custom_palette
+
+palette_13 <- c(brewer.pal(9, "Set1"), brewer.pal(4, "Paired"))
+palette_13 %>% dput
+
+custom_palette_13 <- c("#E41A1C", "#377EB8", "#4DAF4A", "#984EA3", "#FF7F00", "#B2B223", 
+"#A65628", "#F781BF", "#999999", "#A6CEE3", "#1F78B4", "#FF7F7F", 
+"#33A02C")
+```
+
+```{r, eval = F}
+DimPlot(seu, label = T, repel = T, reduction = "umap", group.by = "CellType", cols = palette_13, pt.size = 1.5) + ggtitle("") + theme_bw(base_size = 14) + xlab("UMAP 1") + ylab("UMAP 2")  + NoLegend()
+
+seu.dat
+```
+
+```{r}
+label_data <- seu.dat %>%
+  group_by(CellType) %>%
+  summarise(
+    UMAP_1 = mean(UMAP_1),
+    UMAP_2 = mean(UMAP_2)
+  )
+label_data_custom <- label_data %>%
+  mutate(UMAP_1 = ifelse(CellType == "Hofbauer", UMAP_1 - 1, UMAP_1)) %>%
+  mutate(UMAP_1 = ifelse(CellType == "Cytotrophoblast", UMAP_1 + 0.5, UMAP_1)) %>%
+  mutate(UMAP_2 = ifelse(CellType == "Whole tissue", UMAP_2 + 1, UMAP_2)) %>%
+  #mutate(UMAP_2 = ifelse(CellType == "Stromal", UMAP_2 - 0.5, UMAP_2)) %>%
+  mutate(UMAP_2 = ifelse(CellType == "Syncytiotrophoblast", UMAP_2 - 1, UMAP_2))
+
+
+# Basic ggplot with UMAP coordinates and cluster labels
+ggplot(seu.dat, aes(x = UMAP_1, y = UMAP_2, color = CellType)) +
+  geom_point(size = 1.5, alpha = 0.5) +  # Adjust point size and transparency as needed
+  scale_color_manual(values = custom_palette_13) +
+  theme_bw() +
+  theme(legend.position = "none") +
+  xlab("UMAP 1") +
+  ylab("UMAP 2") +
+   geom_text_repel(
+    data = label_data_custom,
+    aes(x = UMAP_1, y = UMAP_2, label = CellType),
+    size = 5,
+    box.padding = 0.5,
+    point.padding = 0.5,
+    segment.color = "black"
+  )
+
+#ggsave(filename = here("results", "analytic", "umap_viz", "umap_all_20241103.tiff"), dpi = 300)
+```
+
+
+```{r, eval =F}
+ggsave(filename = here("results", "analytic", "umap_viz", "umap_all_20231130.png"), dpi = 300)
+```
+
+```{r}
+levels(seu@meta.data$CellType)
+```

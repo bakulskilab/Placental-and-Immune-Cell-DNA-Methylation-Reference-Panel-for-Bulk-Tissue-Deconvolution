@@ -1,0 +1,473 @@
+---
+title: "Merge raw and QC placental cell type"
+author: "Kyle Abraham Campbell"
+date: '2022-09-22'
+output: html_document
+---
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+# CRAN packages
+library(BiocManager)
+library(corrplot)
+library(data.table)
+library(FactoMineR)
+library(factoextra)
+library(GGally)
+library(GEOquery)
+library(ggrepel)
+library(here)
+library(readxl)
+library(svd)
+library(tidymodels)
+library(tidyverse)
+library(viridis)
+
+# BioConductor packages
+library(ChAMP)
+library(ExperimentHub)
+library(FlowSorted.CordBlood.450k)
+library(illuminaio)
+library(IlluminaHumanMethylationEPICmanifest)
+library(IlluminaHumanMethylationEPICanno.ilm10b4.hg19)
+library(minfi)
+#library(wateRmelon)
+
+
+# Github packages
+#devtools::install_github("hhhh5/ewastools@master")
+library(ewastools)
+#devtools::install_github('wvictor14/planet')
+library(planet)
+#remotes::install_github("immunomethylomics/FlowSorted.Blood.EPIC")
+#library(FlowSorted.Blood.EPIC)
+#remotes::install_github("immunomethylomics/FlowSorted.BloodExtended.EPIC")
+#library(FlowSorted.BloodExtended.EPIC)
+```
+
+Initial read in of raw data
+```{r, eval = F}
+# Note: mixture samples have already been dropped from the blood dataset in 'flow_sort_blood_epic_qc.Rmd'
+blood <- readRDS(here("data", "blood_flow_epic", "rgset_extended_no_mix_2022-09-22.rda"))
+blood.pd <- readRDS(here("data", "blood_flow_epic", "pd_formatted.rda"))
+# Get mixture indices
+mix.idx <- which(blood.pd$Celltype == "MIX")
+# Drop mixture samples from 
+blood.pd <- blood.pd[-mix.idx,]
+rm(mix.idx)
+
+# No .idats publicly available for Yuan et al., dataset, but these files came from the Bioconductor ExperimentHub Database
+yuan <- readRDS(file = here("data", "robinson", "raw_eh_6130_rgset.rda"))
+vy.pd <- readRDS(here("data", "robinson", "eh_6132_pdata.rda"))
+# Get indices for Third trimester samples, which is what we're interested in for this reference panel
+third.idx <- vy.pd$Trimester == "Third"
+# Subset to only the third trimester beta matrix samples
+yuan <- yuan[, third.idx]
+
+
+kc <- readRDS(file = here("data", "2021-10-11_kc_minfi_RGset.rda"))
+kc.pd <- readRDS(here("data", paste0("phenotype_dataframe_pd_", "2021-11-09")))
+
+kc.pd.subset <-
+  kc.pd %>%
+  mutate(Study = "Campbell") %>%
+  dplyr::select(Sample.ID,
+                Celltype = phenotype,
+                Study,
+                Sex = sex,
+                Case_ID = Placenta,
+                Sentrix_ID,
+                Sentrix_Position
+                ) %>%
+  rename("CellType" = Celltype) %>%
+  mutate_if(is.factor, as.character)
+
+kc.pd.subset$CellType <- recode(kc.pd.subset$CellType,
+                                VT = "Villi",
+                                CT = "Cytotrophoblast",
+                                ST = "Syncytiotrophoblast",
+                                HB = "Hofbauer",
+                                FB = "Stromal")
+
+vy.pd.subset <-
+  vy.pd %>%
+  mutate(Study = "Yuan") %>%
+  filter(Trimester == "Third") %>%
+  dplyr::select("Sample.ID" = Sample_Name,
+                Celltype,
+                Study,
+                Sex,
+                Case_ID,
+                Sentrix_ID,
+                Sentrix_Position
+                ) %>%
+  rename("CellType" = Celltype) %>%
+  mutate_if(is.factor, as.character)
+
+vy.pd.subset$CellType <- recode(vy.pd.subset$CellType,
+                                `Trophoblasts cs` = "Cytotrophoblast",
+                                `Trophoblasts enz` = "Syncytiotrophoblast",
+                                `Hofbauer cs` = "Hofbauer",
+                                `Endothelial cs` = "Endothelial",
+                                `Stromal cs` = "Stromal")
+
+blood.pd.subset <-
+  blood.pd %>%
+  mutate(Study = "Salas") %>%
+  dplyr::select("Sample.ID" = Sample_Name,
+                Celltype,
+                Study,
+                Sex,
+                "Case_ID" = Subject.ID,
+                Sentrix_ID,
+                Sentrix_Position
+                ) %>%
+  rename("CellType" = Celltype) %>%
+  mutate_if(is.factor, as.character)
+
+pData(yuan) <- as(vy.pd.subset, "DataFrame")
+pData(kc) <- as(kc.pd.subset, "DataFrame")
+pData(blood) <- as(blood.pd.subset, "DataFrame")
+
+placenta <- combineArrays(kc, yuan)
+rge <- combineArrays(placenta, blood)
+
+#saveRDS(rge, here("data", "analytic", "raw_rge_Campbell_Salas_Yuan_2022-11-01.rda"))
+
+pData(rge) %>% as.data.frame() %>% View()
+```
+
+Save/load
+```{r}
+#saveRDS(yuan, here("data", "analytic", "yuan", paste0("yuan_raw_rge_", Sys.Date(), ".rda")))
+rge <- readRDS(here("data", "analytic", "yuan", "yuan_raw_rge_2023-11-09.rda"))
+pd <- pData(rge) %>% as.data.frame()
+clin.covariates <- c("Sex", "CellType", "Case_ID", "Study", "Sentrix_ID", "Sentrix_Position")
+```
+
+```{r, include = F, eval = F}
+#saveRDS(rge, here("data", "analytic", paste0("rge_kc_vy_salas2018_", Sys.Date(), ".rda")))
+# The adult blood and two placenta datasets merged (EPIC)
+rge <- readRDS(here("data", "analytic", paste0("raw_rge_Campbell_Salas_Yuan_2022-11-01.rda")))
+pd <- pData(rge) %>% as.data.frame()
+#saveRDS(pd,file = here("data", paste0("rge_kc_vy_salas2018_2022-09-26.rda")))
+```
+
+```{r}
+pd %>% filter(CellType != "Villi") %>% dim()
+```
+
+```{r}
+manifest = data.table::copy(ewastools:::manifest_epic)
+```
+
+Create MethylSet
+```{r}
+rawMSet <- preprocessRaw(rge)
+rawMSet
+```
+
+```{r}
+Meth <- getMeth(rawMSet)
+Meth[1:5, 1:5]
+```
+
+```{r}
+Unmeth <- getUnmeth(rawMSet) 
+Unmeth[1:5, 1:5]
+```
+
+## Visualize Methylated and Unmethylated Intensities
+
+Flag 0 low intensity samples
+```{r}
+pd <- pData(rge) %>% as.data.frame()
+
+# Overall intensity: M vs. U
+pd$MQC <- log2(colMedians(Meth))
+pd$UQC <- log2(colMedians(Unmeth))
+```
+
+Graphing function, taken from EGESS module 2
+```{r}
+intenseplot <- function(col = ""){
+  ggplot(pd, aes_string(x = "UQC", y = "MQC", color = col)) + 
+    geom_point() + 
+    #coord_cartesian(xlim = c(11, 13), ylim = c (11, 13)) +
+    labs(x = "Log2 Median Unmethylated Intensity", y = "Log2 Median Methylated intensity",
+         color = sprintf("Sample %s", col)) + #sprintf() %s means 'insert a character string here' and col is the R object with the corresponding string
+    theme_bw() +
+    ggtitle(col)
+}
+```
+
+```{r}
+map(clin.covariates, intenseplot)
+```
+
+Any low intensity samples? No
+```{r}
+# Drop (or if really small sample: watch out for): Samples with UQC<11 & MQC<11
+# Note the cutoff value (here, 11) would depend on your data and array (EPIC/450k)
+sum(pd$UQC < 11)
+```
+
+```{r}
+sum(pd$MQC < 11)
+```
+
+```{r}
+rm(Meth, Unmeth) # Clean up our coding environment
+```
+
+```{r}
+pd <-
+  pd %>%
+  mutate(flag_lowintensity = ifelse(
+    UQC < 11 & MQC < 11,
+    TRUE,
+    FALSE
+  )) %>%
+  mutate(CellType = factor(CellType))
+```
+
+```{r}
+densityPlot(rawMSet, sampGroups = pd$CellType, legend = F)
+```
+
+error
+```{r}
+#densityBeanPlot(rawMSet, sampGroups = pd$CellType)
+```
+
+## Check sex
+```{r}
+grs <- rawMSet %>% mapToGenome() %>% ratioConvert()
+```
+
+```{r}
+sex.info <- getSex(grs)
+
+pd$predictedSex <- sex.info$predictedSex
+pd$xMed <- sex.info$xMed
+pd$yMed <- sex.info$yMed
+```
+
+Predicted sex matches up with annotated sex
+```{r}
+ggplot(data = pd, mapping = aes(x = xMed, y = yMed, color = predictedSex, fill = predictedSex)) + geom_point()
+ggplot(data = pd, mapping = aes(x = xMed, y = yMed, color = Sex, fill = Sex)) + geom_point()
+```
+
+No sex mismatches
+```{r}
+pd %>%
+  filter(predictedSex != Sex)
+```
+
+```{r}
+rm(grs)
+rm(rawMSet)
+```
+
+
+## Genotype
+
+27 of 99 are outliers but no disagreements?
+```{r}
+#snps <- getSnpInfo(grs)
+snps.beta <- getSnpBeta(rge)
+genotypes <- call_genotypes(snps.beta, learn = F)
+pd$outlier <- snp_outliers(genotypes)
+
+(pd$outlier < -4) %>% summary
+```
+
+No concerning conflicts found
+```{r}
+check_snp_agreement(genotypes, donor_ids = pd$Case_ID, pd$Sample.ID)
+```
+
+## NBeads
+
+```{r}
+nbeads <- wateRmelon::beadcount(rge)
+
+beadmean <- data.frame(bmean = rowMeans(nbeads, na.rm = T))
+
+ggplot(beadmean, aes(x = bmean)) +
+  geom_histogram(bins = 200, color = "black", fill = "grey") +
+  coord_cartesian(xlim = c(0, 25)) +
+  labs(x = "Probe mean beadcount") +
+  theme_bw()
+```
+
+10 with < 5 and 8 na
+```{r}
+summary(beadmean < 5)
+```
+
+```{r}
+na.idx <- is.na(beadmean)
+```
+
+Start with 866,091 sites
+```{r}
+ms.noob <- preprocessNoob(rge)
+ms.noob
+#saveRDS(ms.noob, here("data", "Campbell_Salas_Yuan_raw_ms_noob_2022-11-01.rda"))
+```
+
+The 8 site with missing beadmean
+```{r}
+names(ms.noob[na.idx, ])
+manifest %>% filter(probe_id %in% names(ms.noob[na.idx,]))
+```
+
+Drop the 18 probes with low bead count or NA, leaving 866073
+```{r}
+keep.bead.idx <- (beadmean$bmean >= 5 & is.na(beadmean$bmean) == F)
+ms.noob.nbead <- ms.noob[keep.bead.idx, ]
+ms.noob.nbead
+```
+
+## detectionP
+SNPs already get dropped by preprocessNoob it appears
+```{r}
+detectionP <- detectionP.minfi(rge)
+detectionP <- detectionP[keep.bead.idx, ]
+```
+
+```{r}
+detprobe <- data.frame(pmean = rowMeans(detectionP, na.rm = T)) 
+probecut <- 0.01
+```
+
+```{r}
+ggplot(detprobe, aes(x = pmean)) +
+  geom_histogram(color = "black", fill = "grey", bins = 1000) +
+  coord_cartesian(xlim = c(0, 0.08), ylim = c(0, 5e4)) +
+  geom_vline(xintercept = probecut, color = "red", linetype = "dashed") +
+  theme_bw() +
+  labs(x = "Mean detectionP per probe", y = "Count") +
+  ggtitle("All Samples")
+```
+
+29,747 probes have average detP > 0.01
+```{r}
+table(detprobe$pmean > 0.01)
+```
+
+Only 3.4% are over the threshold
+```{r}
+table(detprobe$pmean > 0.01) %>% '/'(nrow(detprobe)) %>% round(digits = 3)
+```
+
+Get the % detP failure rate (x/total number samples) for each probe
+```{r}
+prob.fail <- apply(X = detectionP, MARGIN = 1, FUN = function(x) (x > 0.01) %>% as.numeric() %>% mean)
+```
+
+31,375 probes had greater than 5% of samples failure rate for detP
+```{r}
+probes.to.drop.detp <- prob.fail > 0.05
+summary(probes.to.drop.detp)
+```
+
+Subset noob-normalized MethylSet to drop failed detP probes
+```{r}
+ms.noob.nbead.detP <- ms.noob.nbead[!probes.to.drop.detp,]
+```
+
+## Cross-reactive probes
+
+Zhou et al., 2017 Alternative resource:"Comprehensive characterization, annotation and innovative use of Infinium DNA methylation BeadChip probes" {
+Three groups of probes should generally be filtered out from Infinium microarray analyses: (i) probes with internal SNPs close to the 3΄ end of the probe (Group 1); (ii) probes with non-unique mapping to the bisulfite-converted genome (Group 2); and (iii) probes with off-target hybridization due to partial overlap with non-unique elements (Group 3). } http://zwdzwd.github.io/InfiniumAnnotation#current
+
+Read in Pidsley et al., 2016 or Zhou, 2017 (will use) cross-reactive probes
+```{r}
+#cross.reactive <- read_csv(here("data" , "pidsley_cross-reactive_probes.csv"))
+#MASK_general contains generally advised probes for dropping
+cross.reactive <- read_tsv(here("data", "EPIC.hg19.manifest.tsv")) 
+```
+
+Get ProbeIDs to drop (~96k probes)
+```{r}
+cross.reactive.probes <- 
+  cross.reactive %>%
+  filter(MASK_general == T) %>%
+  pull(probeID)
+```
+
+Drop cross-reactive probes from beta matrix
+```{r}
+ms.noob.nbead.detP.xreac <- ms.noob.nbead.detP[!rownames(ms.noob.nbead.detP) %in% cross.reactive.probes,]
+```
+
+93564 cross-reactive probes dropped
+```{r}
+#paste0(dim(ms.noob.nbead.detP)[[1]] - dim(ms.noob.nbead.detP.xreac)[[1]], " cross-reactive probes (Pidsley et al., 2016) dropped")
+dim(ms.noob.nbead.detP.xreac)
+
+paste0(dim(ms.noob.nbead.detP)[[1]] - dim(ms.noob.nbead.detP.xreac)[[1]], " cross-reactive probes (Zhou et al., 2017) dropped")
+dim(ms.noob.nbead.detP.xreac)
+```
+
+## Drop sex-linked probes
+
+Load ewastools manifest
+```{r}
+manifest = data.table::copy(ewastools:::manifest_epic)
+```
+
+Drop 15622 sex-linked probes
+```{r}
+chrXY.to.drop = manifest[chr%in%c("X","Y"),probe_id]
+length(chrXY.to.drop)
+ms.noob.nbead.detP.xreac.auto <- ms.noob.nbead.detP.xreac[!rownames(ms.noob.nbead.detP.xreac) %in% chrXY.to.drop,]
+
+paste0(dim(ms.noob.nbead.detP.xreac)[[1]] - dim(ms.noob.nbead.detP.xreac.auto)[[1]], " sex-linked probes dropped")
+dim(ms.noob.nbead.detP.xreac.auto)
+```
+
+Save QC'd MethylSet
+```{r}
+#saveRDS(ms.noob.nbead.detP.xreac.auto, here("data", "analytic", "yuan", "qced_MethylSet_yuan_2023-11-10.rds"))
+```
+
+
+Convert to beta 
+```{r}
+beta <- getBeta(ms.noob.nbead.detP.xreac.auto)
+```
+
+BMIQ norm
+```{r}
+beta.bmiq <- champ.norm(beta, resultsDir = here("data", "analytic", "yuan", "epic"), plotBMIQ = T, arraytype = "EPIC", cores = 8, method = "BMIQ")
+rownames(beta.bmiq) <- rownames(beta)
+colnames(beta.bmiq) <- colnames(beta)
+```
+
+
+## Save result
+725512 sites across 99 samples
+```{r}
+dim(beta.bmiq)
+
+#saveRDS(beta.bmiq, file = here("data", "analytic", "yuan", paste0("beta_bmiq_qced_yuan_", Sys.Date(), ".rda")))
+
+#saveRDS(pd, file = here("data", "analytic", "yuan", paste0("beta_bmiq_qced_yuan_pd_", Sys.Date(), ".rda")))
+
+#readRDS(here("data", "analytic", "yuan", "beta_bmiq_qced_yuan_2023-11-14.rda"))
+#readRDS(here("data", "analytic", "yuan", "beta_bmiq_qced_yuan_pd_2023-11-14.rda"))
+
+```
+
+```{r}
+rownames(plCellCpGsThird) %in% rownames(readRDS(here("data", "analytic", "yuan", "beta_bmiq_qced_yuan_2023-11-14.rda")))
+```
+
+
+```{r}
+#saveRDS(ms.noob.nbead.detP.xreac.auto %>% getBeta(), file = here("data", "analytic", paste0("qc_beta_all_", Sys.Date(), ".rda")))
+```

@@ -1,0 +1,787 @@
+---
+title: "deconvolution"
+author: "Kyle Abraham Campbell"
+date: "1/11/2022"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+# CRAN packages
+#library(GEOquery)
+library(BiocManager)
+library(corrplot)
+library(data.table)
+library(dbscan)
+library(here)
+library(factoextra)
+library(GGally)
+library(ggpubr)
+library(ggrepel)
+library(gtsummary)
+library(here)
+library(openxlsx)
+library(pheatmap)
+library(qqman)
+library(RColorBrewer)
+library(readxl)
+library(Seurat)
+#remotes::install_github('satijalab/seurat-wrappers')
+# May need to unset GITHUB PAT key
+#library(SeuratWrappers)
+library(svd)
+library(tidymodels)
+library(tidyverse)
+library(umap)
+library(viridis)
+
+options(ggrepel.max.overlaps = Inf)
+
+# BioConductor packages
+library(EpiDISH)
+#TODO install DMRcate on laptop workstation
+# DSS dependency install failure
+library(genefilter)
+library(minfi)
+
+# Github packages
+#devtools::install_github("hhhh5/ewastools@master")
+library(ewastools)
+#devtools::install_github('wvictor14/planet')
+library(planet)
+
+# Source custom functions
+source(here("scripts", "analytic", "00_custom_helper_scripts", "10_custom_functions.R"))
+
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+### Notes
+
+https://bmcbioinformatics.biomedcentral.com/articles/10.1186/1471-2105-11-587 Use of M-values instead of beta values
+https://www.ncbi.nlm.nih.gov/pmc/articles/PMC6449748/ Discussion of M-value and beta-value in DNAm differential methylation
+https://www.bioconductor.org/packages/release/workflows/vignettes/methylationArrayAnalysis/inst/doc/methylationArrayAnalysis.html#quality-control Bioconductor tutorial for DNAm microarray analysis
+
+### Load data
+
+Load the data
+```{r}
+# These are the intraplacental KC sampling (pick the technical replicate with the most cell type observations)
+# can add one Salas technical replicate sample, when necessary
+
+beta <- readRDS(file  = here("data", "analytic", "campbell_yuan_concat", "beta_2023-11-13.rda"))
+pd <- readRDS(here("data", "analytic", "campbell_yuan_concat", "pd_2023-11-13.rda"))
+rownames(pd) <- pd$Sample.ID
+dim(pd)
+
+beta.all <- beta
+pd.all <- pd
+```
+
+Subset out ST for projection onto PC space later; not used
+```{r, eval = F}
+pd <- pd.all %>%
+  filter(CellType != "Syncytiotrophoblast")
+beta <- beta.all[,colnames(beta.all) %in% (pd %>% pull(Sample.ID))]
+```
+
+
+```{r}
+table(pd$CellType)
+#table(pd$Celltype, pd$Case_ID)
+```
+
+## Feature selection and dimension reduction
+
+```{r}
+# Get the variance for each probe
+probe.variances <- apply(X = beta, MARGIN = 1, FUN = var)
+names(probe.variances) <- rownames(beta)
+hist(probe.variances)
+```
+
+10% is approx. 80,000k sites
+```{r}
+top_percentile <- 0.10
+ceiling(length(probe.variances) * top_percentile)
+variable.probes <- sort(probe.variances, decreasing = T)[1:ceiling(length(probe.variances) * top_percentile)]
+hist(variable.probes)
+```
+
+```{r}
+variable.probes.idx <- which(rownames(beta) %in% names(variable.probes))
+beta.var <- beta[variable.probes.idx,]
+```
+
+## Correlation/clustering
+
+```{r, eval = F}
+cor.matrix <- cor(beta.var)
+
+anno_df <- data.frame("Cell_Type" = pd$CellType,
+                      "Study" = pd$Study)
+rownames(anno_df) <- pd$Sample.ID
+
+pheatmap(beta.markers, show_rownames = F)
+pheatmap <- pheatmap(beta.markers, show_rownames = F, annotation_col = anno_df, fontsize_col = 2)
+
+pheatmap <- pheatmap(cor.matrix, show_rownames = F, annotation_col = anno_df, fontsize_col = 2)
+```
+
+ST samples w/ tighter correlation to VT samples based on the above correlation matrix: KC79−D_ST, KC79−B_ST, KC74_ST, KC79−C_ST, KC70_ST; still didn't help the ST overrepresentation at deconvolution
+```{r}
+#save_pheatmap_pdf(pheatmap, here("results", "beta_placenta_va_heatmap.pdf"))
+```
+
+## DBSCAN, not used
+
+Try DBSCAN
+```{r, eval = F, include=F}
+res.dbscan <- dbscan(t(beta.var), eps = 26, minPts = 4)
+res.dbscan$cluster
+```
+
+HDBSCAN shows there are 4 major clusters, with the trophoblast/villous cluster being the largest
+```{r}
+res.hdb <- hdbscan(t(beta.var), minPts = 4)
+plot(res.hdb, show_flat = TRUE)
+```
+
+## Try w/ Seurat
+
+```{r}
+pipe.fast.seu <- function(seu) {
+  seu <- ScaleData(seu, do.scale = T, do.center = T)
+  seu <- RunPCA(seu, features = rownames(seu))
+  seu <- FindNeighbors(object = seu)
+  seu <- FindClusters(object = seu)
+  seu <- RunUMAP(seu, dims = 1:30)
+  return(seu)
+}
+```
+
+PCs have specific probes associated with them, could  tie them to genes? Not pursued
+```{r}
+set.seed(42)
+# No probe filtering before PCA, saved at the end of this chunk to avoid lengthy re-run of ~6GB object, acidentally overwritten
+#seu <- CreateSeuratObject(counts = beta.placenta, data = beta.placenta, meta.data = pd)
+# Top variable probes
+seu <- CreateSeuratObject(counts = beta.var, data = beta.var, meta.data = pd)
+seu
+# What if I allow scale and center? previously was false
+seu <- ScaleData(seu, do.scale = T, do.center = T)
+seu <- RunPCA(seu, features = rownames(beta.var))
+seu <- FindNeighbors(object = seu)
+seu <- FindClusters(object = seu)
+seu <- RunUMAP(seu, dims = 1:30)
+#saveRDS(seu, here("data", "seu_beta_placenta_celltypes_2022-10-29.rda"))
+```
+
+Get PCA variance explained
+```{r}
+pca = seu@reductions$pca
+eigValues = (pca@stdev)^2  ## EigenValues
+varExplained = eigValues / sum(eigValues)
+print(varExplained[1:5])
+```
+
+Seurat clustree analysis
+```{r, results='hide'}
+#results='hide'
+set.seed(42)
+# Function that accepts Seurat  that has been processed up to the clustering step, clusters at desired resolutions (vector), adds cluster identities at different resolutions, and returns Seurat object with resolution cluster identities
+Seurat_clustree <- function (seuratObject, resolutions) {
+  
+  for(hyperparameter in resolutions) {
+    print(hyperparameter)
+    prefix <- paste0("res.", hyperparameter)
+    print(prefix)
+    #seuratObject <- FindNeighbors(object = seuratObject, reduction = "umap", dims = 1:2)
+    seuratObject <- FindClusters(object = seuratObject, resolution = hyperparameter)
+    seuratObject <- AddMetaData(object = seuratObject, metadata = seuratObject$seurat_clusters, col.name = prefix)
+  }
+  return(seuratObject)
+}
+
+resolutions <- seq(from = 1, to = 4, by = .1)
+seu <- Seurat_clustree(seu, resolutions)
+```
+
+Option to rerun with only trophoblast subtypes to compare to Villous tissue, unpursued
+```{r, eval = F}
+seu.trophoblast <- seu[,which(pd$CellType %in% c("Cytotrophoblast", "Syncytiotrophoblast", "Villi"))]
+seu.trophoblast <- pipe.fast.seu(seu.trophoblast)
+
+DimPlot(seu.trophoblast, group.by = "CellType", label = T, repel = T) + NoLegend()
+DimPlot(seu.trophoblast, label = T, repel = T) + NoLegend()
+
+resolutions <- seq(from = 0.1, to = 1.2, by = .1)
+seu.trophoblast <- Seurat_clustree(seu.trophoblast, resolutions)
+seu.trophoblast <- FindClusters(seu.trophoblast, resolution = 0.5)
+library(clustree)
+clustree(seu.trophoblast, prefix = "res.", node_colour = "sc3_stability") + theme(legend.position = "bottom") + guides(edge_alpha = F)
+```
+
+
+Iterating over 0.2 to 0.7 clustering resolution and graphing, Starts at 4 clusters, goes to 5 and then 6, and then 7 at high res
+```{r clustree_graph}
+library(clustree)
+clustree(seu, prefix = "res.", node_colour = "sc3_stability") + theme(legend.position = "bottom") + guides(edge_alpha = F)
+```
+
+Export Seurat metadata and add dimension reduction for ggplotting
+```{r}
+seu.dat <- seu@meta.data
+seu.dat$CellType <- factor(seu.dat$CellType, levels = c("Cytotrophoblast", "Endothelial", "Hofbauer", "Stromal", "Syncytiotrophoblast", "Villi"))
+seu.dat$UMAP_1 <- seu@reductions$umap@cell.embeddings %>% as.data.frame() %>% pull(umap_1)
+seu.dat$UMAP_2 <- seu@reductions$umap@cell.embeddings %>% as.data.frame() %>% pull(umap_2)
+seu.dat$PC_1 <- seu@reductions$pca@cell.embeddings %>% as.data.frame() %>% pull(PC_1)
+seu.dat$PC_2 <- seu@reductions$pca@cell.embeddings %>% as.data.frame() %>% pull(PC_2)
+
+# Add dbscan clusters
+#seu.dat$cluster_dbscan <- factor(res.dbscan$cluster)
+
+# Add hdb clusters
+seu.dat$cluster_hdb <- factor(res.hdb$cluster)
+
+#saveRDS(seu.dat, here::here("data", "analytic", "deconvolution_pruning_no_dup_dat_pca_umap_2022-10-31.rda"))
+```
+
+Look at PCA dimension reduction across different key clustering resolution parameters
+
+Could look at loadings (esp. PC1) to determine why some (particularly KC samples) stromal cells appear to cluster with CTs and/or STs (might share common non-Villous tissue sample; could check heatmap of the CpGs that load that way), unpursued
+```{r}
+#ggplot(data = seu.dat, mapping = aes(x = PC_1, y = PC_2, color = res.0.1, fill = res.0.1, shape = CellType)) + geom_point() + facet_wrap(vars(Study)) + theme_bw()
+#ggplot(data = seu.dat, mapping = aes(x = PC_1, y = PC_2, color = res.0.2, fill = res.0.2, shape = CellType)) + geom_point() + facet_wrap(vars(Study)) + theme_bw()
+#ggplot(data = seu.dat, mapping = aes(x = PC_1, y = PC_2, color = res.0.5, fill = res.0.5, shape = CellType)) + geom_point() + facet_wrap(vars(Study)) + theme_bw()
+ggplot(data = seu.dat, mapping = aes(x = PC_1, y = PC_2, color = res.1, fill = res.1, shape = CellType)) + geom_point() + facet_wrap(vars(Study)) + theme_bw()
+ggplot(data = seu.dat, mapping = aes(x = PC_1, y = PC_2, color = res.1.5, fill = res.1.5, shape = CellType)) + geom_point() + facet_wrap(vars(Study)) + theme_bw()
+ggplot(data = seu.dat, mapping = aes(x = PC_1, y = PC_2, color = res.2.3, fill = res.2.3, shape = CellType)) + geom_point() + facet_wrap(vars(Study)) + theme_bw()
+ggplot(data = seu.dat, mapping = aes(x = PC_1, y = PC_2, color = res.3.1, fill = res.3.1, shape = CellType)) + geom_point() + facet_wrap(vars(Study)) + theme_bw()
+ggplot(data = seu.dat, mapping = aes(x = PC_1, y = PC_2, color = res.3.3, fill = res.3.3, shape = CellType)) + geom_point() + facet_wrap(vars(Study)) + theme_bw()
+ggplot(data = seu.dat, mapping = aes(x = PC_1, y = PC_2, color = res.3.4, fill = res.3.4, shape = CellType)) + geom_point() + facet_wrap(vars(Study)) + theme_bw()
+ggplot(data = seu.dat, mapping = aes(x = PC_1, y = PC_2, color = res.4, fill = res.4, shape = CellType)) + geom_point() + facet_wrap(vars(Study)) + theme_bw()
+#ggplot(data = seu.dat, mapping = aes(x = PC_1, y = PC_2, color = cluster_hdb, fill = cluster_hdb, shape = CellType)) + geom_point() + facet_wrap(vars(Study)) + theme_bw()
+#ggplot(data = seu.dat, mapping = aes(x = PC_1, y = PC_2, color = cluster_dbscan, fill = cluster_dbscan, shape = CellType)) + geom_point() + facet_wrap(vars(Study)) + theme_bw()
+```
+
+Res.2.3 appears the most informative and is used for the rest of downstream analysis
+```{r}
+ggplot(data = seu.dat, mapping = aes(x = PC_1, y = PC_2, color = res.2.3, fill = res.2.3, shape = CellType)) + geom_point() + facet_wrap(vars(Case_ID)) + theme_bw()
+```
+
+Performing the same visual inspection of clutsering hyperparameters except on UMAP low-dimensional space
+```{r}
+ggplot(data = seu.dat, mapping = aes(x = UMAP_1, y = UMAP_2, color = res.1, fill = res.1, shape = CellType)) + geom_point() + facet_wrap(vars(Study)) + theme_bw()
+ggplot(data = seu.dat, mapping = aes(x = UMAP_1, y = UMAP_2, color = res.1.5, fill = res.1.5, shape = CellType)) + geom_point() + facet_wrap(vars(Study)) + theme_bw()
+ggplot(data = seu.dat, mapping = aes(x = UMAP_1, y = UMAP_2, color = res.2.3, fill = res.2.3, shape = CellType)) + geom_point() + facet_wrap(vars(Study)) + theme_bw()
+
+ggplot(data = seu.dat, mapping = aes(x = UMAP_1, y = UMAP_2, color = res.3.1, fill = res.3.1, shape = CellType)) + geom_point() + facet_wrap(vars(Study)) + theme_bw()
+
+ggplot(data = seu.dat, mapping = aes(x = UMAP_1, y = UMAP_2, color = res.3.3, fill = res.3.3, shape = CellType)) + geom_point() + facet_wrap(vars(Study)) + theme_bw()
+ggplot(data = seu.dat, mapping = aes(x = UMAP_1, y = UMAP_2, color = res.3.4, fill = res.3.4, shape = CellType)) + geom_point() + facet_wrap(vars(Study)) + theme_bw()
+```
+
+
+
+## Projecting onto broad epidish reference
+
+```{r}
+epidish_RPC <- epidish(
+    beta.m = beta,
+    ref.m = centEpiFibIC.m,
+    method = "RPC"
+)
+estimates.centEpiFibIC.m <- epidish_RPC$estF %>% as.data.frame() %>% rownames_to_column(var = "Sample.ID")
+#apply(X = epidish_RPC$estF, MARGIN = 2,FUN = mean)
+pd.estimates <- left_join(pd, estimates.centEpiFibIC.m)
+
+centEpiFibIC.m.means <- pd.estimates %>% group_by(CellType, Study) %>% summarise(epi_mean = mean(Epi), fib_mean = mean(Fib), ic_mean = mean(IC))
+```
+
+```{r}
+seu.dat %>% filter(Study == "Campbell") %>% filter( res.3.4 == 4) %>% filter( CellType == "Syncytiotrophoblast") %>% pull(Sample.ID)
+
+# KC 77 ST samples that cluster with CTs have high immune cell %
+pd.estimates %>% filter(Case_ID == "KC77")
+
+# KC 77 ST samples that cluster with CTs have high immune cell %
+pd.estimates %>% filter(CellType == "Syncytiotrophoblast")
+```
+
+## Pulling sample IDs
+
+Think we have a winner, going to drop any STs that don't cluster with cytotrophoblast samples more closely than villi
+
+18 KC ST drops, but this includes replicates
+8 BIO KC ST drops (so 10 replicate drops)
+1 VY ST drop
+```{r}
+res.2.3.st.drop.cluster <- seu.dat %>% filter(CellType == "Syncytiotrophoblast" & !(res.2.3 %in% c(3, 6))) %>% pull(Sample.ID)
+res.2.3.st.kc.drop <- seu.dat %>% filter(CellType == "Syncytiotrophoblast" & Study == "Campbell") %>% pull(Sample.ID)
+res.2.3.st.drop <- union(res.2.3.st.drop.cluster, res.2.3.st.kc.drop)
+res.2.3.st.drop
+#saveRDS(res.1.5.drop.ids, here("data", "analytic", "ST_drop_ids_not_in_CT_cluster_.rda"))
+```
+
+Also going to pull out some of the cytotrophoblast samples that cluster with Villous samples; may have to revisit some Campbell fibroblast samples. Dropping these CT samples seemed to address the variabilty in xval but not the stromal/cyto trade-off we see
+
+5 CT KC drops
+11 CT VY drops
+```{r}
+res.2.3.ct.drop.ids <- seu.dat %>% filter(CellType == "Cytotrophoblast" & !(res.2.3 %in% 3)) %>% pull(Sample.ID)
+res.2.3.ct.drop.ids
+#saveRDS(res.1.5.ct.drop.ids, here("data", "analytic", "CT_drop_ids_in_large_villous_cluster_.rda"))
+```
+
+11 Campbell FB drops
+```{r}
+res.2.3.fb.drop.ids <- seu.dat %>% filter(CellType == "Stromal" & !(res.2.3 %in% 4)) %>% pull(Sample.ID)
+res.2.3.fb.drop.ids
+#saveRDS(res.1.5.fb.drop.ids, here("data", "analytic", "FB_drop_ids_in_CT_cluster_.rda"))
+```
+
+Drop 1 Hofbauer from KC that doesn't cluster with other Hofbauers
+```{r}
+res.2.3.hb.drop.ids <- seu.dat %>% filter(CellType == "Hofbauer" & !(res.2.3 %in% 2)) %>% pull(Sample.ID)
+res.2.3.hb.drop.ids
+```
+
+```{r}
+drop.ids <- c(res.2.3.st.drop, res.2.3.hb.drop.ids, res.2.3.fb.drop.ids, res.2.3.ct.drop.ids)
+
+pd.rep.ids <- pd %>% filter(!Sample.ID %in% drop.ids) %>%  filter(Case_ID %in% c("KC77", "KC78", "KC79", "KC84")) %>%
+  mutate(replicate = substr(Sample.ID, 6, 6)) %>%
+  mutate(rep.id = paste0(Case_ID, replicate))
+table(pd.rep.ids$CellType, pd.rep.ids$rep.id)
+
+rep.drop.ids <- pd.rep.ids %>%
+  filter(!(rep.id %in% c("KC77B", "KC78C", "KC79B", "KC84B"))) %>%
+  pull(Sample.ID)
+rep.drop.ids
+
+pd.rep.ids.dropped <- pd %>% filter(!Sample.ID %in% drop.ids) %>% filter(!Sample.ID %in% rep.drop.ids)
+pd.rep.ids.that.dropped <- pd %>% filter(Sample.ID %in% drop.ids)
+
+# Subtract out the 10 ST replicates, there are 8 BIO reps to keep here
+pd.rep.ids.that.dropped %>% filter(CellType == "Syncytiotrophoblast") %>% filter(Study == "Campbell")
+
+all.drop.ids <- union(rep.drop.ids, drop.ids)
+```
+
+Supplementary figure to demonstrate inconsistent clustering
+```{r}
+seu.dat.no.rep <- seu.dat %>%
+  filter(!Sample.ID %in% rep.drop.ids) %>%
+  mutate(Excluded = ifelse(Sample.ID %in% drop.ids, "Excluded", "Included")) %>%
+  mutate(Cluster = res.1)
+dim(seu.dat.no.rep)
+
+seu.dat.no.rep$Excluded %>% factor() %>%  summary
+
+seu.dat.rep <- seu.dat %>%
+  mutate(replicate = substr(Sample.ID, 6, 6)) %>%
+  mutate(rep.id = paste0(Case_ID, replicate)) %>%
+  filter((rep.id %in% c("KC77B", "KC78C", "KC79B", "KC84B"))) %>%
+  mutate(Excluded = ifelse(Sample.ID %in% drop.ids, "Excluded", "Included")) %>%
+  mutate(Cluster = res.1)
+
+umap <- ggplot(data = seu.dat.no.rep, mapping = aes(x = UMAP_1, y = UMAP_2, color = Cluster, fill = Cluster, shape = CellType)) + geom_point() + facet_wrap(vars(Excluded)) + theme_bw() + labs(shape = "Cell Type", fill = "Data-driven Cluster", color = "Data-driven Cluster")
+umap
+
+#saveRDS(umap, here("results", "analytic", "cell_type_purity", "umap.rds"))
+
+#umap <- readRDS( here("results", "analytic", "cell_type_purity", "umap.rds"))
+
+#ggsave(here("results", "analytic", "cell_type_purity", "UMAP_include_exclude.png"))
+```
+
+## Assessing external reference purity improvements
+
+```{r}
+pd.estimates <- pd.estimates %>%
+  filter(!Sample.ID %in% rep.drop.ids) %>% 
+  mutate(included = ifelse(
+  Sample.ID %in% drop.ids,
+  FALSE,
+  TRUE
+)) %>%
+  arrange(included, CellType)
+#write.xlsx(pd.estimates, here("results", "analytic", "cell_type_purity", "epidish_centEpiFibIC.m.xlsx"))
+# 135 placental cell type samples evaluated
+dim(pd.estimates %>% filter(CellType != "Villi"))
+# 88 placental cell type samples included
+dim(pd.estimates %>% filter(CellType != "Villi") %>% filter(!Sample.ID %in% all.drop.ids))
+
+ # Get mean descriptive
+pd.estimates.mean <- pd.estimates %>%
+  group_by(included, CellType) %>%
+  summarise(Epi_mean = mean(Epi),
+            Fib_mean = mean(Fib),
+            IC_mean  = mean(IC)) %>%
+  arrange(CellType)
+#pd.estimates.mean
+#write.xlsx(pd.estimates.mean, here("results", "analytic", "cell_type_purity", "epidish_centEpiFibIC.m_means.xlsx"))
+
+
+wilcox.test(Epi ~ included, alternative = "less", data = pd.estimates %>% filter(CellType == "Cytotrophoblast"))
+dim(pd.estimates %>% filter(CellType == "Cytotrophoblast"))
+dim(pd.estimates %>% filter(CellType == "Cytotrophoblast") %>% filter(included == T))
+
+wilcox.test(IC ~ included, alternative = "less", data = pd.estimates %>% filter(CellType == "Hofbauer"))
+dim(pd.estimates %>% filter(CellType == "Hofbauer"))
+dim(pd.estimates %>% filter(CellType == "Hofbauer") %>% filter(included == T))
+
+wilcox.test(Fib ~ included, alternative = "less", data = pd.estimates %>% filter(CellType == "Stromal"))
+dim(pd.estimates %>% filter(CellType == "Stromal"))
+dim(pd.estimates %>% filter(CellType == "Stromal") %>% filter(included == T))
+
+wilcox.test(Epi ~ included, alternative = "less", data = pd.estimates %>% filter(CellType == "Syncytiotrophoblast"))
+dim(pd.estimates %>% filter(CellType == "Syncytiotrophoblast"))
+dim(pd.estimates %>% filter(CellType == "Syncytiotrophoblast") %>% filter(included == T))
+```
+### Bar chart comparing included and excluded samples
+
+```{r}
+long <- pd.estimates %>%
+  filter(!CellType %in% c("Endothelial", "Villi")) %>%
+  mutate(included = case_when(
+    included == TRUE ~ "Analytic sample",
+    included == FALSE ~ "Before low purity exclusion"
+  )) %>%
+  mutate(included = fct_rev(included)) %>%
+  dplyr::rename(Epithelial = Epi,
+                Immune = IC,
+                Fibroblast = Fib,
+                `Cell Type` = CellType,
+                Included = included) %>%
+  pivot_longer(cols = c("Epithelial", "Immune", "Fibroblast"), values_to = "Proportion", names_to = "Estimated Lineage")
+
+bar_chart <- ggplot(data = long, mapping = aes(x = Included, y = Proportion, fill = `Estimated Lineage`)) +
+  geom_bar(stat = "identity", position = "fill") +
+  facet_wrap(vars(`Cell Type`)) +
+  xlab("") +
+  scale_y_continuous(labels = scales::percent) +
+  theme_bw()+
+  theme(axis.text.x = element_text(angle = 30, hjust = 1, vjust = 1))
+bar_chart
+
+#saveRDS(bar_chart, here("results", "analytic", "cell_type_purity", "bar_chart.rds"))
+bar_chart <- readRDS(here("results", "analytic", "cell_type_purity", "bar_chart.rds"))
+
+#ggplot(data = long, mapping = aes(x = Included, y = Proportion, fill = `Estimated Lineage`)) +
+#  geom_violin() +
+#  facet_wrap(vars(`Cell Type`))
+```
+
+Exporting multipanel supplementary figure with patchwork
+```{r, eval = F}
+# Had to restart RStudio without loading Seurat and SeuratWrappers to function properly
+# When recreating this figure later, only SeuratWrappers had to be unloaded
+umap <- readRDS( here("results", "analytic", "cell_type_purity", "umap.rds"))
+bar_chart <- readRDS(here("results", "analytic", "cell_type_purity", "bar_chart.rds"))
+library(patchwork)
+combined_plot <- (umap) / (bar_chart)
+ggsave(combined_plot, height = 8, width = 8, dpi = 300, filename = here("results", "analytic", "cell_type_purity", "low_purity.tiff"))
+```
+
+```{r}
+seu.dat.dropped <- seu.dat %>% filter(!Sample.ID %in% all.drop.ids)
+
+ggplot(data = seu.dat.dropped, mapping = aes(x = UMAP_1, y = UMAP_2, color = res.1.5, fill = res.1.5, shape = CellType)) + geom_point() + theme_bw()
+ggplot(data = seu.dat.dropped, mapping = aes(x = UMAP_1, y = UMAP_2, color = res.2.3, fill = res.2.3, shape = CellType)) + geom_point() + theme_bw()
+ggplot(data = seu.dat.dropped, mapping = aes(x = UMAP_1, y = UMAP_2, color = res.1.5, fill = res.1.5, shape = CellType)) + geom_point() + theme_bw() + facet_wrap(vars(Study))
+ggplot(data = seu.dat.dropped, mapping = aes(x = UMAP_1, y = UMAP_2, color = res.2.3, fill = res.2.3, shape = CellType)) + geom_point() + theme_bw() + facet_wrap(vars(Study))
+ggplot(data = seu.dat.dropped, mapping = aes(x = UMAP_1, y = UMAP_2, color = res.3.1, fill = res.3.1, shape = CellType)) + geom_point() + theme_bw() + facet_wrap(vars(Study))
+ggplot(data = seu.dat.dropped, mapping = aes(x = UMAP_1, y = UMAP_2, color = res.3.3, fill = res.3.3, shape = CellType)) + geom_point() + theme_bw() + facet_wrap(vars(Study))
+ggplot(data = seu.dat.dropped, mapping = aes(x = UMAP_1, y = UMAP_2, color = res.3.4, fill = res.3.4, shape = CellType)) + geom_point() + theme_bw() + facet_wrap(vars(Study))
+ggplot(data = seu.dat.dropped, mapping = aes(x = PC_1, y = PC_2, color = res.2.3, fill = res.2.3, shape = CellType)) + geom_point() + facet_wrap(vars(Study)) + theme_bw()
+```
+
+```{r}
+ggplot(data = seu.dat.dropped, mapping = aes(x = PC_1, y = PC_2, color = CellType, fill = CellType)) + geom_point() + theme_bw() + xlab(paste0("PC1 - ", round(varExplained[1]*100, 2), "% Variance Explained")) + ylab(paste0("PC2 - ", round(varExplained[2]*100, 2), "% Variance Explained"))
+```
+
+### re-run seurat after dropping
+```{r}
+seu.dropped <- seu[,!(colnames(seu) %in% all.drop.ids)]
+seu.dropped <- pipe.fast.seu(seu.dropped)
+```
+
+```{r}
+DimPlot(seu.dropped, reduction = "pca", group.by = "CellType")
+DimPlot(seu.dropped, reduction = "umap", group.by = "CellType")
+```
+
+### Case_ID facet_wrap
+```{r}
+ggplot(data = seu.dat, mapping = aes(x = UMAP_1, y = UMAP_2, color = res.1.5, fill = res.1.5, shape = CellType)) + geom_point() + theme_bw() + facet_wrap(vars(Case_ID))
+#ggsave(here("results", "a_case_id_umap.png"))
+ggplot(data = seu.dat.dropped, mapping = aes(x = UMAP_1, y = UMAP_2, color = res.1.5, fill = res.1.5, shape = CellType)) + geom_point() + theme_bw() + facet_wrap(vars(Case_ID))
+#ggsave(here("results", "a_case_id_umap_dropped.png"))
+```
+
+## Save
+
+```{r}
+keep.ids <- seu.dat.dropped$Sample.ID
+#saveRDS(keep.ids, file = here("data", "analytic", "campbell_yuan_concat", "strict_keep_2023-11-15.rda"))
+```
+
+
+### Repeat w/ ComBaT, below not used
+Logistic transformation used (as in CHAMP) to bound beta between 0 and 1
+```{r}
+#beta.placenta.combat <- sva::ComBat(beta.placenta, batch = pd.pca$Study)
+beta.placenta.logit <- beta.placenta %>% car::logit()
+
+beta.placenta.logit.combat <- sva::ComBat(beta.placenta.logit, batch = pd$Study)
+# <- champ.runCombat(beta = beta.placenta, pd = pd.pca, variablename = NULL, batchname = c("Study"))
+
+beta.placenta.combat <- gtools::inv.logit(beta.placenta.logit.combat)
+
+# Get the variance for each probe
+probe.variances <- apply(X = beta.placenta.combat, MARGIN = 1, FUN = var)
+names(probe.variances) <- rownames(beta.placenta.combat)
+hist(probe.variances)
+
+#10% is approx. 80,000k sites
+length(probe.variances) * .05
+variable.probes <- sort(probe.variances, decreasing = T)[1:ceiling(length(probe.variances) * .05)]
+hist(variable.probes)
+
+variable.probes.idx <- which(rownames(beta.placenta.combat) %in% names(variable.probes))
+beta.placenta.combat.var <- beta.placenta.combat[variable.probes.idx,]
+```
+
+
+PCs have specific probes associated with them, could do tie them to genes?
+```{r}
+set.seed(42)
+# No probe filtering before PCA, saved at the end of this chunk to avoid lengthy re-run of ~6GB object, acidentally overwritten
+#seu <- CreateSeuratObject(counts = beta.placenta, data = beta.placenta, meta.data = pd)
+# Top variable probes
+seu <- CreateSeuratObject(counts = beta.placenta.combat.var, data = beta.placenta.combat.var, meta.data = pd)
+seu <- ScaleData(seu, do.scale = F, do.center = F)
+seu <- RunPCA(seu, features = rownames(beta.placenta.combat.var))
+seu <- FindNeighbors(object = seu)
+seu <- FindClusters(object = seu)
+seu <- RunUMAP(seu, dims = 1:30)
+#saveRDS(seu, here("data", "seu_beta_placenta_celltypes_2022-10-29.rda"))
+```
+
+
+```{r}
+set.seed(42)
+# Function that accepts Seurat  that has been processed up to the clustering step, clusters at desired resolutions (vector), adds cluster identities at different resolutions, and returns Seurat object with resolution cluster identities
+Seurat_clustree <- function (seuratObject, resolutions) {
+  
+  for(hyperparameter in resolutions) {
+    print(hyperparameter)
+    prefix <- paste0("res.", hyperparameter)
+    print(prefix)
+    seuratObject <- FindClusters(object = seuratObject, resolution = hyperparameter)
+    seuratObject <- AddMetaData(object = seuratObject, metadata = seuratObject$seurat_clusters, col.name = prefix)
+  }
+  return(seuratObject)
+}
+
+resolutions <- seq(from = 0.1, to = 2.5, by = .1)
+seu <- Seurat_clustree(seu, resolutions)
+```
+
+Iterating over 0.2 to 0.7 clustering resolution, Starts at 4 clusters, goes to 5 and then 6 
+```{r clustree_graph}
+library(clustree)
+clustree(seu, prefix = "res.", node_colour = "sc3_stability") + theme(legend.position = "bottom") + guides(edge_alpha = F)
+```
+
+```{r}
+DimPlot(mnn, group.by = "CellType", label = T) + NoLegend()
+```
+
+
+```{r}
+seu.dat <- seu@meta.data
+seu.dat$UMAP_1 <- seu@reductions$umap@cell.embeddings %>% as.data.frame() %>% pull(UMAP_1)
+seu.dat$UMAP_2 <- seu@reductions$umap@cell.embeddings %>% as.data.frame() %>% pull(UMAP_2)
+seu.dat$PC_1 <- seu@reductions$pca@cell.embeddings %>% as.data.frame() %>% pull(PC_1)
+seu.dat$PC_2 <- seu@reductions$pca@cell.embeddings %>% as.data.frame() %>% pull(PC_2)
+```
+
+```{r}
+ggplot(data = seu.dat, mapping = aes(x = UMAP_1, y = UMAP_2, color = res.1.5, fill = res.1.5, shape = Study)) + geom_point() + theme_bw()
+```
+
+```{r}
+ggplot(data = seu.dat, mapping = aes(x = UMAP_1, y = UMAP_2, color = CellType, fill = CellType, shape = Study)) + geom_point() + theme_bw()
+```
+
+```{r}
+ggplot(data = seu.dat, mapping = aes(x = UMAP_1, y = UMAP_2, color = CellType, fill = CellType, shape = Study)) + geom_point() + theme_bw()
+```
+
+```{r}
+ggplot(data = seu.dat, mapping = aes(x = UMAP_1, y = UMAP_2, color = res.0.1, fill = res.0.1, shape = CellType)) + geom_point() + theme_bw()
+ggplot(data = seu.dat, mapping = aes(x = UMAP_1, y = UMAP_2, color = res.0.2, fill = res.0.2, shape = CellType)) + geom_point() + theme_bw()
+ggplot(data = seu.dat, mapping = aes(x = UMAP_1, y = UMAP_2, color = res.0.5, fill = res.0.5, shape = CellType)) + geom_point() + theme_bw()
+ggplot(data = seu.dat, mapping = aes(x = UMAP_1, y = UMAP_2, color = res.1, fill = res.1, shape = CellType)) + geom_point() + theme_bw()
+ggplot(data = seu.dat, mapping = aes(x = UMAP_1, y = UMAP_2, color = res.1.5, fill = res.1.5, shape = CellType)) + geom_point() + theme_bw()
+ggplot(data = seu.dat, mapping = aes(x = UMAP_1, y = UMAP_2, color = res.2.3, fill = res.2.3, shape = CellType)) + geom_point() + theme_bw()
+```
+
+```{r}
+ggplot(data = seu.dat, mapping = aes(x = UMAP_1, y = UMAP_2, color = res.0.1, fill = res.0.1, shape = CellType)) + geom_point() + facet_wrap(vars(Study)) + theme_bw()
+ggplot(data = seu.dat, mapping = aes(x = UMAP_1, y = UMAP_2, color = res.0.2, fill = res.0.2, shape = CellType)) + geom_point() + facet_wrap(vars(Study)) + theme_bw()
+ggplot(data = seu.dat, mapping = aes(x = UMAP_1, y = UMAP_2, color = res.0.5, fill = res.0.5, shape = CellType)) + geom_point() + facet_wrap(vars(Study)) + theme_bw()
+ggplot(data = seu.dat, mapping = aes(x = UMAP_1, y = UMAP_2, color = res.1, fill = res.1, shape = CellType)) + geom_point() + facet_wrap(vars(Study)) + theme_bw()
+ggplot(data = seu.dat, mapping = aes(x = UMAP_1, y = UMAP_2, color = res.1.5, fill = res.1.5, shape = CellType)) + geom_point() + facet_wrap(vars(Study)) + theme_bw()
+ggplot(data = seu.dat, mapping = aes(x = UMAP_1, y = UMAPfg_2, color = res.2.3, fill = res.2.3, shape = CellType)) + geom_point() + facet_wrap(vars(Study)) + theme_bw()
+```
+
+```{r}
+ggplot(data = seu.dat, mapping = aes(x = PC_1, y = PC_2, color = res.0.1, fill = res.0.1, shape = CellType)) + geom_point() + theme_bw()
+ggplot(data = seu.dat, mapping = aes(x = PC_1, y = PC_2, color = res.0.2, fill = res.0.2, shape = CellType)) + geom_point() + theme_bw()
+ggplot(data = seu.dat, mapping = aes(x = PC_1, y = PC_2, color = res.0.5, fill = res.0.5, shape = CellType)) + geom_point() + theme_bw()
+ggplot(data = seu.dat, mapping = aes(x = PC_1, y = PC_2, color = res.1, fill = res.1, shape = CellType)) + geom_point() + theme_bw()
+ggplot(data = seu.dat, mapping = aes(x = PC_1, y = PC_2, color = res.1.5, fill = res.1.5, shape = CellType)) + geom_point() + theme_bw()
+ggplot(data = seu.dat, mapping = aes(x = PC_1, y = PC_2, color = res.2.3, fill = res.2.3, shape = CellType)) + geom_point() + theme_bw()
+```
+
+```{r}
+ggplot(data = seu.dat, mapping = aes(x = PC_1, y = PC_2, color = res.0.1, fill = res.0.1, shape = CellType)) + geom_point() + facet_wrap(vars(Study)) + theme_bw()
+ggplot(data = seu.dat, mapping = aes(x = PC_1, y = PC_2, color = res.0.2, fill = res.0.2, shape = CellType)) + geom_point() + facet_wrap(vars(Study)) + theme_bw()
+ggplot(data = seu.dat, mapping = aes(x = PC_1, y = PC_2, color = res.0.5, fill = res.0.5, shape = CellType)) + geom_point() + facet_wrap(vars(Study)) + theme_bw()
+ggplot(data = seu.dat, mapping = aes(x = PC_1, y = PC_2, color = res.1, fill = res.1, shape = CellType)) + geom_point() + facet_wrap(vars(Study)) + theme_bw()
+ggplot(data = seu.dat, mapping = aes(x = PC_1, y = PC_2, color = res.1.5, fill = res.1.5, shape = CellType)) + geom_point() + facet_wrap(vars(Study)) + theme_bw()
+ggplot(data = seu.dat, mapping = aes(x = PC_1, y = PC_2, color = res.2.3, fill = res.2.3, shape = CellType)) + geom_point() + facet_wrap(vars(Study)) + theme_bw()
+```
+
+```{r}
+pca.dat = beta.placenta.combat
+dim(pca.dat)
+pca.dat = na.omit(pca.dat)
+dim(pca.dat)
+pca.dat = t(pca.dat)
+
+res.pca <- PCA(pca.dat, scale.unit = FALSE, ncp = 15, graph = FALSE)
+
+print(fviz_eig(res.pca, addlabels = TRUE))#, ylim = c(0, 100))
+
+var <- get_pca_var(res.pca)
+
+pc.coord <- res.pca$ind$coord %>% as.data.frame
+pc.coord$Sample.ID <- placental.sample.ids
+
+pd.pca <- pd %>% filter(Sample.ID %in% placental.sample.ids)
+
+dat.combat <- left_join(pd.pca, pc.coord, by = "Sample.ID")
+
+#saveRDS(dat, here::here("data", "analytic", "placenta_studies_noob_bmiq_pca_combat_by_study_dat_2022-10-24.rda"))
+
+pc.dat <- res.pca$ind$coord %>% as.data.frame
+pc.dat.umap <- umap(pc.dat)
+umap.coord <- pc.dat.umap$layout %>% as.data.frame %>% rownames_to_column("Sample.ID")
+umap.dat.combat <- left_join(pd.pca, umap.coord, by = "Sample.ID")
+```
+
+```{r}
+ggplot(data = umap.dat, mapping = aes(x = V1, y = V2, color = CellType, fill = CellType, shape = Study)) + geom_point() + theme_bw() + ggtitle("UMAP - placenta")
+```
+
+
+```{r}
+ggplot(data = umap.dat, mapping = aes(x = V1, y = V2, color = CellType, fill = CellType, shape = Study)) + geom_point() + theme_bw() + ggtitle("UMAP - placenta") + facet_wrap(vars(Study))
+```
+
+### Predict cell composition of all samples using EpiDISH reference
+
+```{r}
+data(centEpiFibIC.m)
+# robust partial correlations
+epidish_RPC <- epidish(
+    beta.m = beta.placenta,
+    ref.m = centEpiFibIC.m,
+    method = "RPC"
+)
+
+pheatmap(t(epidish_RPC$estF))
+est <- epidish_RPC$estF %>% as.data.frame() %>% rownames_to_column(var = "Sample.ID")
+dat.est <- left_join(pd, est)
+colnames(dat.est)
+dat.est.epidish.gg <- dat.est %>%
+  pivot_longer(cols = c("Epi", "Fib", "IC"), names_to = "Cell_Type_Proportion", values_to = "Percentage")
+```
+
+```{r}
+dat.est.epidish.gg.campbell <- dat.est.epidish.gg %>% filter(Study == "Campbell")
+dat.est.epidish.gg.yuan <- dat.est.epidish.gg %>% filter(Study == "Yuan")
+dat.est.epidish.gg.salas <- dat.est.epidish.gg %>% filter(Study == "Salas")
+```
+
+Create an initial exclusion criteria (>50% broad class cell type from ENCODE) to set the PCA centroids
+```{r}
+purity_threshold <- 0.50
+dat.est.purity.flag <- 
+  dat.est %>%
+  mutate(high_purity =
+           case_when(
+             (CellType %in% c("Syncytiotrophoblast", "Cytotrophoblast")) & Epi >= 0.7 ~ T,
+             CellType == "Hofbauer" & IC >= purity_threshold ~ T,
+             CellType == "Stromal" & Fib >= purity_threshold ~ T
+           )
+  )
+
+dat.est.purity.flag$high_purity <- dat.est.purity.flag$high_purity %>% replace_na(F)
+
+table(dat.est.purity.flag$CellType, dat.est.purity.flag$high_purity)
+table(dat.est.purity.flag$Study, dat.est.purity.flag$high_purity)
+
+dat.est.purity.flag.campbell <- dat.est.purity.flag %>% filter(Study == "Campbell")
+table(dat.est.purity.flag.campbell$CellType, dat.est.purity.flag.campbell$high_purity)
+dat.est.purity.flag.yuan <- dat.est.purity.flag %>% filter(Study == "Yuan")
+table(dat.est.purity.flag.yuan$CellType, dat.est.purity.flag.yuan$high_purity)
+```
+
+```{r}
+umap.dat <- left_join(umap.dat, dat.est.purity.flag)
+```
+
+```{r}
+ggplot(data = umap.dat, mapping = aes(x = V1, y = V2, color = CellType, fill = CellType, shape = high_purity)) + geom_point() + theme_bw() + ggtitle("UMAP - placenta") + facet_wrap(vars(Study))
+```
+
+```{r}
+ggplot(data = umap.dat, mapping = aes(x = V1, y = V2, color = CellType, fill = CellType, shape = high_purity)) + geom_point() + theme_bw() + ggtitle("UMAP - placenta")
+```
+
+```{r}
+dat.est.epidish.gg
+
+ggplot(dat.est.epidish.gg %>% filter(CellType %in% c("Villi", "Syncytiotrophoblast", "Cytotrophoblast")), mapping = aes(x = Sample.ID, y = Percentage, fill = Cell_Type_Proportion)) +
+  geom_bar(position = "fill", stat = "identity") + 
+  facet_wrap(facets = "CellType", scales="free_x") +
+  xlab("")
+```
+
+
+```{r}
+ggplot(dat.est.epidish.gg.campbell, mapping = aes(x = Sample.ID, y = Percentage, fill = Cell_Type_Proportion)) +
+  geom_bar(position = "fill", stat = "identity") + 
+  facet_wrap(facets = "CellType", scales="free_x") +
+  xlab("")
+#ggsave(here("results", "epidish_estimated_fractions_campbell.png"))
+```
+
+```{r}
+ggplot(dat.est.epidish.gg.yuan, mapping = aes(x = Sample.ID, y = Percentage, fill = Cell_Type_Proportion)) +
+  geom_bar(position = "fill", stat = "identity") + 
+  facet_wrap(facets = "CellType", scales="free_x") +
+#ggsave(here("results", "epidish_estimated_fractions_yuan.png"))
+```
+
+```{r}
+ggplot(dat.est.epidish.gg.salas, mapping = aes(x = Sample.ID, y = Percentage, fill = Cell_Type_Proportion)) +
+  geom_bar(stat = "identity") +
+  facet_wrap(facets = "CellType")
+#ggsave(here("results", "epidish_estimated_fractions_salas.png"))
+```

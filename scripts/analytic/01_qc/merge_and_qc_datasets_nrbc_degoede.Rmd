@@ -1,0 +1,386 @@
+---
+title: "Merge raw and QC placental cell type"
+author: "Kyle Abraham Campbell"
+date: '2022-09-22'
+output: html_document
+---
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+# CRAN packages
+library(BiocManager)
+library(corrplot)
+library(data.table)
+library(FactoMineR)
+library(factoextra)
+library(GGally)
+library(GEOquery)
+library(ggrepel)
+library(here)
+library(readxl)
+library(svd)
+library(tidymodels)
+library(tidyverse)
+library(viridis)
+
+# BioConductor packages
+library(ChAMP)
+library(ExperimentHub)
+library(FlowSorted.CordBlood.450k)
+library(illuminaio)
+library(IlluminaHumanMethylationEPICmanifest)
+library(IlluminaHumanMethylationEPICanno.ilm10b4.hg19)
+library(minfi)
+#library(wateRmelon)
+
+
+# Github packages
+#devtools::install_github("hhhh5/ewastools@master")
+library(ewastools)
+#devtools::install_github('wvictor14/planet')
+library(planet)
+#remotes::install_github("immunomethylomics/FlowSorted.Blood.EPIC")
+library(FlowSorted.Blood.EPIC)
+#remotes::install_github("immunomethylomics/FlowSorted.BloodExtended.EPIC")
+library(FlowSorted.BloodExtended.EPIC)
+```
+
+```{r}
+# Read the RGSet
+cord <-
+    libraryDataGet('FlowSorted.CordBloodCombined.450k')
+cord.pd <- pData(cord) %>% as.data.frame
+
+# Get deGoede indices and subset accordingly
+study.idx <- cord.pd$Study %in% c("deGoede")
+cord.pd <- cord.pd[study.idx,]
+cord <- cord[, study.idx]
+
+# Reformat cord.pd
+# Reminder on rename syntax: new_name = old_name
+cord.pd.x <- cord.pd %>%
+  dplyr::rename(
+    Sample.ID = "Sample_Name",
+    Case_ID = "Subject.ID",
+    Sentrix_ID = "Slide",
+    Sentrix_Position = "Array"
+  ) %>%
+  mutate(Sample.ID = ifelse(
+    Study == "deGoede",
+    paste0(Case_ID, "_", CellType_original),
+    Sample.ID
+  ))
+
+# Reassign pd on RGset
+pData(cord) <- as(cord.pd.x, "DataFrame")
+
+#cord.nrbc.only <- cord[,cord$CellType == "nRBC"]
+#cord.nrbc.only.noob <- preprocessNoob(cord.nrbc.only)
+# Save a raw RGSet w/ just nRBC samples
+#saveRDS(cord.nrbc.only, here("data", "cord", "raw_rgset_cord_nrbc_only.rda"))
+```
+
+```{r}
+rge <- cord
+pd <- cord.pd.x
+#rm(cord)
+#rm(cord.pd)
+#rm(cord.nrbc.only)
+```
+
+```{r}
+# Note, not actually RGSetExtended, just keeping name the same for ease of porting code
+#rge <- readRDS(here("data", "cord", "cord_nrbc_formatted_rgset_10-17-2022.rda"))
+#pd <- pData(rge) %>% as.data.frame()
+```
+
+```{r}
+manifest = data.table::copy(ewastools:::manifest_450K)
+```
+
+```{r}
+clin.covariates <- c("Sex", "CellType", "Case_ID", "Study")
+```
+
+Create MethylSet
+```{r}
+rawMSet <- preprocessRaw(rge)
+rawMSet
+```
+
+```{r}
+Meth <- getMeth(rawMSet)
+Meth[1:5, 1:5]
+```
+
+```{r}
+Unmeth <- getUnmeth(rawMSet) 
+Unmeth[1:5, 1:5]
+```
+
+## Visualize Methylated and Unmethylated Intensities
+
+Flag 0 low intensity sample
+```{r}
+pd <- pData(rge) %>% as.data.frame()
+
+# Overall intensity: M vs. U
+pd$MQC <- log2(colMedians(Meth))
+pd$UQC <- log2(colMedians(Unmeth))
+```
+
+Graphing function, taken from EGESS module 2
+```{r}
+intenseplot <- function(col = ""){
+  ggplot(pd, aes_string(x = "UQC", y = "MQC", color = col)) + 
+    geom_point() + 
+    #coord_cartesian(xlim = c(11, 13), ylim = c (11, 13)) +
+    labs(x = "Log2 Median Unmethylated Intensity", y = "Log2 Median Methylated intensity",
+         color = sprintf("Sample %s", col)) + #sprintf() %s means 'insert a character string here' and col is the R object with the corresponding string
+    theme_bw() +
+    ggtitle(col)
+}
+```
+
+```{r}
+map(clin.covariates, intenseplot)
+```
+
+Any low intensity samples?
+```{r}
+# Drop (or if really small sample: watch out for): Samples with UQC<11 & MQC<11
+# Note the cutoff value (here, 11) would depend on your data and array (EPIC/450k)
+sum(pd$UQC < 11)
+```
+
+```{r}
+sum(pd$MQC < 11)
+```
+
+```{r}
+rm(Meth, Unmeth) # Clean up our coding environment
+```
+
+```{r}
+pd <-
+  pd %>%
+  mutate(flag_lowintensity = ifelse(
+    UQC < 11 & MQC < 11,
+    TRUE,
+    FALSE
+  )) %>%
+  mutate(CellType = factor(CellType))
+```
+
+```{r}
+densityPlot(rawMSet, sampGroups = pd$CellType, legend = F)
+```
+
+```{r}
+densityBeanPlot(rawMSet, sampGroups = pd$CellType)
+```
+
+## Check sex
+```{r}
+grs <- rawMSet %>% mapToGenome() %>% ratioConvert()
+```
+
+```{r}
+sex.info <- getSex(grs)
+
+pd$predictedSex <- sex.info$predictedSex
+pd$xMed <- sex.info$xMed
+pd$yMed <- sex.info$yMed
+```
+
+Predicted sex matches up with annotated sex
+```{r}
+ggplot(data = pd, mapping = aes(x = xMed, y = yMed, color = predictedSex, fill = predictedSex)) + geom_point()
+ggplot(data = pd, mapping = aes(x = xMed, y = yMed, color = Sex, fill = Sex)) + geom_point()
+```
+
+
+```{r}
+pd %>%
+  filter(predictedSex != Sex)
+```
+
+## Genotype
+
+0 of 52 are outliers but no disagreements
+```{r}
+#snps <- getSnpInfo(grs)
+snps.beta <- getSnpBeta(rge)
+genotypes <- call_genotypes(snps.beta, learn = F)
+pd$outlier <- snp_outliers(genotypes)
+
+(pd$outlier < -4) %>% summary
+```
+
+No concerning conflicts found; genotype agreement was a little low ~.86 for two VY samples; the replicate sample from salas came up as agreement, as expected
+```{r}
+check_snp_agreement(genotypes, donor_ids = pd$Case_ID, sample_ids = pd$Sample.ID)
+```
+
+## NBeads
+We don't have information on beads for the DeGeode samples, so we won't filter on those
+
+Start with 453,093 sites
+```{r}
+ms.noob <- preprocessNoob(rge)
+ms.noob
+```
+
+## detectionP
+SNPs already get dropped by preprocessNoob it appears
+```{r}
+detectionP <- detectionP.minfi(rge)
+```
+
+```{r}
+detprobe <- data.frame(pmean = rowMeans(detectionP, na.rm = T)) 
+probecut <- 0.01
+```
+
+```{r}
+ggplot(detprobe, aes(x = pmean)) +
+  geom_histogram(color = "black", fill = "grey", bins = 1000) +
+  coord_cartesian(xlim = c(0, 0.08), ylim = c(0, 5e4)) +
+  geom_vline(xintercept = probecut, color = "red", linetype = "dashed") +
+  theme_bw() +
+  labs(x = "Mean detectionP per probe", y = "Count") +
+  ggtitle("All Samples")
+```
+
+10955 probes have average detP > 0.01 w/ only nRBC samples
+```{r}
+table(detprobe$pmean > 0.01)
+```
+
+2.4% are over the threshold w/ only nRBC samples
+```{r}
+table(detprobe$pmean > 0.01) %>% '/'(nrow(detprobe)) %>% round(digits = 3)
+```
+
+Get the % detP failure rate (x/total number samples) for each probe
+```{r}
+prob.fail <- apply(X = detectionP, MARGIN = 1, FUN = function(x) (x > 0.01) %>% as.numeric() %>% mean)
+```
+
+21219 probes had greater than 5% of samples failure rate for detP
+```{r}
+probes.to.drop.detp <- prob.fail > 0.05
+summary(probes.to.drop.detp)
+```
+
+Subset noob-normalized MethylSet to drop failed detP probes
+```{r}
+ms.noob.detP <- ms.noob[!probes.to.drop.detp,]
+```
+
+## Cross-reactive probes
+
+Zhou et al., 2017 Alternative resource:"Comprehensive characterization, annotation and innovative use of Infinium DNA methylation BeadChip probes" {
+Three groups of probes should generally be filtered out from Infinium microarray analyses: (i) probes with internal SNPs close to the 3΄ end of the probe (Group 1); (ii) probes with non-unique mapping to the bisulfite-converted genome (Group 2); and (iii) probes with off-target hybridization due to partial overlap with non-unique elements (Group 3). } http://zwdzwd.github.io/InfiniumAnnotation#current
+
+Read in Pidsley et al., 2016 or Zhou, 2017 (will use) cross-reactive probes
+```{r}
+#cross.reactive <- read_csv(here("data" , "pidsley_cross-reactive_probes.csv"))
+#MASK_general contains generally advised probes for dropping
+cross.reactive <- read_tsv(here("data", "HM450.hg19.manifest.tsv")) 
+```
+
+Get ProbeIDs to drop (~60k probes)
+```{r}
+cross.reactive.probes <- 
+  cross.reactive %>%
+  filter(MASK_general == T) %>%
+  pull(probeID)
+length(cross.reactive.probes)
+```
+
+Drop cross-reactive probes from beta matrix
+```{r}
+ms.noob.detP.xreac <- ms.noob.detP[!rownames(ms.noob.detP) %in% cross.reactive.probes,]
+```
+
+51884 cross-reactive probes dropped
+```{r}
+#paste0(dim(ms.noob.detP)[[1]] - dim(ms.noob.detP.xreac)[[1]], " cross-reactive probes (Pidsley et al., 2016) dropped")
+dim(ms.noob.detP.xreac)
+
+paste0(dim(ms.noob.detP)[[1]] - dim(ms.noob.detP.xreac)[[1]], " cross-reactive probes (Zhou et al., 2017) dropped")
+dim(ms.noob.detP.xreac)
+```
+
+## Drop sex-linked probes
+
+Load ewastools manifest
+```{r}
+manifest = data.table::copy(ewastools:::manifest_450K)
+```
+
+Drop 8705 sex-linked probes
+```{r}
+chrXY.to.drop = manifest[chr%in%c("X","Y"),probe_id]
+length(chrXY.to.drop)
+ms.noob.detP.xreac.auto <- ms.noob.detP.xreac[!rownames(ms.noob.detP.xreac) %in% chrXY.to.drop,]
+
+paste0(dim(ms.noob.detP.xreac)[[1]] - dim(ms.noob.detP.xreac.auto)[[1]], " sex-linked probes dropped")
+dim(ms.noob.detP.xreac.auto)
+```
+
+## BMIQ normalization w/ CHAMP
+
+```{r}
+beta = ms.noob.detP.xreac.auto %>% getBeta()
+```
+
+Interactive QC plots from ChAMP
+```{r, eval = F}
+QC.GUI(beta=beta, arraytype="450K", pheno=pd$Study)
+```
+
+Write QC plots to directory with ChAMP
+```{r, eval = F}
+champ.QC(beta=beta, pheno=pd$Study, resultsDir = here("results", "nrbc_bmiq_deGoede"), dendrogram = T, mdsPlot = T)
+```
+
+```{r}
+beta.bmiq <- champ.norm(beta, resultsDir = here("results", "nrbc_bmiq_deGoede"), plotBMIQ = T, arraytype = "450K", cores = 8)
+rownames(beta.bmiq) <- rownames(beta)
+colnames(beta.bmiq) <- colnames(beta)
+```
+
+## Pull only the nRBC profiles
+```{r}
+nrbc.idx <- which(pd$CellType == "nRBC")
+nrbc.idx
+
+## Drop non-nRBC profiles from RGSet and pd 
+nrbc.pd <- pd[nrbc.idx, ]
+nrbc <- ms.noob.detP.xreac.auto[, nrbc.idx]
+pData(nrbc) <- as(nrbc.pd, "DataFrame")
+
+#saveRDS(nrbc.pd, file = here("data", "analytic", "nrbc", "deGoede_nrbc_pd_2023-11-16.rda"))
+```
+
+```{r}
+nrbc
+#saveRDS(nrbc %>% getBeta(), file = here("data", "cord", "beta_noob_nrbc_qc_w_deGoede_deGoede_2022-10-20.rda"))
+```
+
+## Save result
+371285 sites for analysis across 7 samples
+```{r}
+beta.bmiq.nrbc <- beta.bmiq[, nrbc.idx]
+dim(beta.bmiq.nrbc)
+#saveRDS(beta.bmiq.nrbc, file = here("data", "analytic", "nrbc", "beta_noob_bmiq_nrbc_qc_deGoede_2023-11-15.rda"))
+```
+
+
+```{r}
+#saveRDS(ms.noob.detP.xreac.auto, file = here("data", "cord", paste0("qc_methylset_noob_cord_", Sys.Date(), ".rda")))
+#saveRDS(ms.noob.detP.xreac.auto %>% getBeta(), file = here("data", "cord", paste0("qc_methylset_noob_beta_cord_", Sys.Date(), ".rda")))
+#saveRDS(beta.bmiq, file = here("data", "cord", paste0("qc_methylset_noob_bmiq_cord_", Sys.Date(), ".rda")))
+```

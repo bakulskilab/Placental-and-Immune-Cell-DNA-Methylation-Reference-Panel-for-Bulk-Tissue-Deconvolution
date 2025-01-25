@@ -1,0 +1,429 @@
+---
+title: "GSE232778_compare_decon_methods"
+author: "Kyle Abraham Campbell"
+date: "2023-11-01"
+output: html_document
+---
+
+Based on methods presented in:
+Reliability of a novel approach for reference-based cell type estimation in human placental DNA methylation studies
+
+```{r setup, include=FALSE}
+#library(devtools)
+library(corrplot)
+library(devtools)
+library(EpiDISH)
+library(genefilter)
+library(ggcorrplot)
+library(here)
+library(factoextra)
+library(minfi)
+library(openxlsx)
+library(pheatmap)
+library(planet)
+library(skimr)
+library(tidyverse)
+# For pickCompProbes local implementation
+source(here("scripts", "analytic", "00_custom_helper_scripts", "10_custom_functions.R"))
+
+#install_github("Github-MS/xvalglms")
+library(xvalglms)
+
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Load data
+204 whole tissue placental samples
+```{r}
+gse <- read_csv(here("data", "gse232778", "GSE232778_matrixtable_processed_betas.csv")) %>% column_to_rownames(var = "ID_REF")
+gse.pd <- read_csv(here("data", "gse232778", "GSE232778_pdata.csv"))
+
+keep <- gse.pd %>% filter(`characteristics:Replicate_Removed` == F) %>% pull(`characteristics:Sentrix`)
+
+gse.pd <- gse.pd %>% filter(`characteristics:Replicate_Removed` == F)
+gse <- gse[,colnames(gse) %in% keep]
+
+data("plCellCpGsThird")
+```
+
+
+## Examing Yuan cell type reference probes
+
+All Yuan probes are on 450k
+```{r, eval = F}
+cpgs.450k <- IlluminaHumanMethylation450kanno.ilmn12.hg19::Manifest %>% rownames
+# Load Planet CpGs
+data("plCellCpGsThird")
+rownames(plCellCpGsThird) %in% cpgs.450k %>% summary
+# Most of Yuan probes are NOT in written-up Campbell reference, even though there are twice as many
+rownames(plCellCpGsThird) %in% rownames(celltypes.ref) %>% summary
+```
+
+
+## Deconvolution estimates from Campbell reference
+### Load
+```{r}
+#pd <- readRDS(here("data", "analytic", "concat", "pd_2023-11-16.rda")) %>% mutate(CellType = factor(CellType))
+pd <- readRDS(here("data", "analytic", "concat", "pd_2023-11-30.rda")) %>% mutate(CellType = factor(CellType))
+beta <- readRDS(here("data", "analytic", "concat", "beta_2023-11-16.rda"))
+#beta <- beta[,colnames(beta) %in% pd$Sample.ID]
+```
+
+### pickCompProbes
+```{r}
+p <- beta[,colnames(beta) %in% (pd %>% filter(CellType != "Villi") %>% pull(Sample.ID))]
+
+p.villi <- beta[,colnames(beta) %in% (pd %>% filter(CellType == "Villi") %>% pull(Sample.ID))]
+
+pd.fn <- pd %>% filter(CellType != "Villi")
+p.pd <- pd %>% filter(CellType != "Villi")
+pd.villi <- pd %>% filter(CellType == "Villi")
+
+res <- pickCompProbes_kc(
+  p = beta[,colnames(beta) %in% (pd %>% filter(CellType != "Villi") %>% pull(Sample.ID))],
+  pd.fn = pd %>% filter(CellType != "Villi"),
+  numProbes = 30
+  )
+```
+
+Export reference package datasets
+```{r, eval = F}
+save(p.villi, file = here("data", "analytic", "reference_package", "p_villi.rda"))
+save(pd.villi, file = here("data", "analytic", "reference_package", "pd_villi.rda"))
+save(p, file = here("data", "analytic", "reference_package", "p.rda"))
+save(p.pd, file = here("data", "analytic", "reference_package", "pd.rda"))
+
+ref <- res$coefEsts[, colnames(res$coefEsts) != "Villi"]
+ref.df <- ref %>% as.data.frame()
+
+save(ref, file = here("data", "analytic", "reference_package", "ref.rda"))
+#save(ref, file = here("ref.rda"))
+#load(here("data", "analytic", "reference_package", "ref.rda"))
+write_csv(x = ref.df, here("ref.csv"))
+```
+
+### Deconvolution
+```{r}
+epidish.res <- epidish(beta.m = gse, ref.m = res$coefEsts[, colnames(res$coefEsts) != "Villi"], method = "RPC")
+#head(epidish.res$estF)
+cor(epidish.res$estF[,12], gse.pd$`characteristics:Syncytiotrophoblast`)
+
+x <- epidish.res$estF %>% as.data.frame() %>% rownames_to_column(var = "characteristics:Sentrix")
+
+gse.pd.x <- left_join(gse.pd, x)
+```
+
+## Create PCA of gse matrix
+PC1: 15.4%
+PC2: 5.9%
+PC3: 3.5%
+PC4: 3.2%
+PC5: 2.0%
+PC6: 1.9%
+PC7: 1.6%
+PC8: 1.4%
+PC9: 1.1%
+PC10: 1.1%
+```{r}
+# Perform PCA w/o scaling because beta values are all on same scale
+res.pca <- prcomp(t(gse), scale = FALSE)
+summary(res.pca)
+fviz_eig(res.pca)
+res.pca$x
+res.pca.x <- res.pca$x %>% as.data.frame() %>% dplyr::select(PC1:PC10) %>% rownames_to_column(var = "characteristics:Sentrix")
+
+pd.x.x <- gse.pd.x %>%
+  left_join(res.pca.x) %>%
+  dplyr::select(!c("characteristics:Sentrix_ID", "characteristics:AIMs_Coordinate_1", "characteristics:AIMs_Coordinate_2", "characteristics:AIMs_Coordinate_3", "characteristics:PlaNET_GA_RRPC", "characteristics:PlaNET_Prob_African", "characteristics:PlaNET_Prob_Asian", "characteristics:PlaNET_Prob_European")) 
+pd.x.x$PC1 %>% summary()
+```
+
+### Reformat phenotype matrix
+
+```{r}
+colnames(pd.x.x) <- gsub(pattern = "characteristics:", replacement = "planet_", x = colnames(pd.x.x))
+colnames(pd.x.x)
+
+pd.x.x.num <- pd.x.x %>%
+  dplyr::select(where(is.numeric)) %>%
+  drop_na() %>% 
+  dplyr::rename(
+    Birthweight_g = planet_Birthweight_g,
+    Gestational_age = planet_GA_Reported,
+  ) %>%
+  #dplyr::select(!c(PC7, PC8, PC9, PC10)) %>%
+  dplyr::select(!c(Birthweight_g, Gestational_age, planet_Birthweight_SD)) %>%
+  dplyr::rename(
+    `PC1 (15.4%)` = PC1,
+    `PC2 (5.9%)` = PC2,
+    `PC3 (3.5%)` = PC3,
+    `PC4 (3.2%)` = PC4,
+    `PC5 (2.0%)` = PC5,
+    `PC6 (1.9%)` = PC6,
+    `PC7 (1.6%)` = PC7,
+    `PC8 (1.4%)` = PC8,
+    `PC9 (1.1%)` = PC9,
+    `PC10 (1.1%)` = PC10
+  )
+colnames(pd.x.x.num)
+```
+
+## Check cor matrix
+```{r}
+# Example of what's used below
+#pd.x.x %>% dplyr::select(where(is.numeric)) %>% dplyr::select(!c(nRBC, "characteristics:Sentrix_ID", "characteristics:AIMs_Coordinate_1", "characteristics:AIMs_Coordinate_2", "characteristics:AIMs_Coordinate_3", "characteristics:PlaNET_GA_RRPC", "characteristics:PlaNET_Prob_African", "characteristics:PlaNET_Prob_Asian", "characteristics:PlaNET_Prob_European"))
+
+# Dropped 2 missing values for reported GA
+M = cor(pd.x.x.num)
+#ggcorrplot(M)
+pmat <- cor_pmat(M)
+ggcorrplot <- ggcorrplot(M, type = "lower", tl.cex = 7, p.mat = pmat)
+ggcorrplot
+#ggsave(plot = ggcorrplot, here("results", "analytic", "xval_glm", "corrplot.tiff"), dpi = 300)
+```
+
+
+## Setup models
+Drop Syncytiotrophoblast from models to avoid collinearity issues
+```{r}
+#Vectorized
+
+list.models =
+  list(
+    "PC1" = list(PC1 ~ Cytotrophoblast + Hofbauer + Stromal + Endothelial + Neu + NK + Bcell + CD4T + CD8T + Mono  + nRBC,
+    PC1 ~ `planet_Cytotrophoblast` + `planet_Stromal` + `planet_Hofbauer` + `planet_Endothelial` + `planet_nRBC`),
+    
+    "PC2" = list(PC2 ~ Cytotrophoblast + Hofbauer + Stromal + Endothelial + Neu + NK + Bcell + CD4T + CD8T + Mono  + nRBC,
+    PC2 ~ `planet_Cytotrophoblast` + `planet_Stromal` + `planet_Hofbauer` + `planet_Endothelial` + `planet_nRBC`),
+    "PC3" = list(PC3 ~ Cytotrophoblast + Hofbauer + Stromal + Endothelial + Neu + NK + Bcell + CD4T + CD8T + Mono  + nRBC,
+    PC3 ~ `planet_Cytotrophoblast` + `planet_Stromal` + `planet_Hofbauer` + `planet_Endothelial` + `planet_nRBC`),
+    "PC4" = list(PC4 ~ Cytotrophoblast + Hofbauer + Stromal + Endothelial + Neu + NK + Bcell + CD4T + CD8T + Mono  + nRBC,
+    PC4 ~ `planet_Cytotrophoblast` + `planet_Stromal` + `planet_Hofbauer` + `planet_Endothelial` + `planet_nRBC`),
+    "PC5" = list(PC5 ~ Cytotrophoblast + Hofbauer + Stromal + Endothelial + Neu + NK + Bcell + CD4T + CD8T + Mono  + nRBC,
+    PC5 ~ `planet_Cytotrophoblast` + `planet_Stromal` + `planet_Hofbauer` + `planet_Endothelial` + `planet_nRBC`),
+    "PC6" = list(PC6 ~ Cytotrophoblast + Hofbauer + Stromal + Endothelial + Neu + NK + Bcell + CD4T + CD8T + Mono  + nRBC,
+    PC6 ~ `planet_Cytotrophoblast` + `planet_Stromal` + `planet_Hofbauer` + `planet_Endothelial` + `planet_nRBC`),
+    "PC7" = list(PC7 ~ Cytotrophoblast + Hofbauer + Stromal + Endothelial + Neu + NK + Bcell + CD4T + CD8T + Mono  + nRBC,
+    PC7 ~ `planet_Cytotrophoblast` + `planet_Stromal` + `planet_Hofbauer` + `planet_Endothelial` + `planet_nRBC`),
+    "PC8" = list(PC8 ~ Cytotrophoblast + Hofbauer + Stromal + Endothelial + Neu + NK + Bcell + CD4T + CD8T + Mono  + nRBC,
+    PC8 ~ `planet_Cytotrophoblast` + `planet_Stromal` + `planet_Hofbauer` + `planet_Endothelial` + `planet_nRBC`),
+    "PC9" = list(PC9 ~ Cytotrophoblast + Hofbauer + Stromal + Endothelial + Neu + NK + Bcell + CD4T + CD8T + Mono  + nRBC,
+    PC9 ~ `planet_Cytotrophoblast` + `planet_Stromal` + `planet_Hofbauer` + `planet_Endothelial` + `planet_nRBC`),
+    "PC10" = list(PC10 ~ Cytotrophoblast + Hofbauer + Stromal + Endothelial + Neu + NK + Bcell + CD4T + CD8T + Mono,
+    PC10 ~ `planet_Cytotrophoblast` + `planet_Stromal` + `planet_Hofbauer` + `planet_Endothelial` + `planet_nRBC`)
+  )
+
+#models =
+#  list(
+#    "Combined reference" = PC1 ~ Cytotrophoblast + Hofbauer + Stromal + Endothelial + Neu + NK + Bcell + #CD4T + CD8T + Mono,
+#    "planet alone" = PC1 ~ `characteristics:Cytotrophoblast` + `characteristics:Stromal` + #`characteristics:Hofbauer` + `characteristics:Endothelial`
+#  )
+```
+
+Original
+```{r, eval = F}
+models =
+  list(
+    PC1 ~ Cytotrophoblast + Hofbauer + Stromal + Endothelial + Neu + NK + Bcell + CD4T + CD8T + Mono,
+    PC1 ~ `planet_Cytotrophoblast` + `planet_Stromal` + `planet_Hofbauer` + `planet_Endothelial`,
+    PC2 ~ Cytotrophoblast + Hofbauer + Stromal + Endothelial + Neu + NK + Bcell + CD4T + CD8T + Mono,
+    PC2 ~ `planet_Cytotrophoblast` + `planet_Stromal` + `planet_Hofbauer` + `planet_Endothelial`,
+    PC3 ~ Cytotrophoblast + Hofbauer + Stromal + Endothelial + Neu + NK + Bcell + CD4T + CD8T + Mono,
+    PC3 ~ `planet_Cytotrophoblast` + `planet_Stromal` + `planet_Hofbauer` + `planet_Endothelial`,
+    PC4 ~ Cytotrophoblast + Hofbauer + Stromal + Endothelial + Neu + NK + Bcell + CD4T + CD8T + Mono,
+    PC4 ~ `planet_Cytotrophoblast` + `planet_Stromal` + `planet_Hofbauer` + `planet_Endothelial`,
+    PC5 ~ Cytotrophoblast + Hofbauer + Stromal + Endothelial + Neu + NK + Bcell + CD4T + CD8T + Mono,
+    PC5 ~ `planet_Cytotrophoblast` + `planet_Stromal` + `planet_Hofbauer` + `planet_Endothelial`,
+    PC6 ~ Cytotrophoblast + Hofbauer + Stromal + Endothelial + Neu + NK + Bcell + CD4T + CD8T + Mono,
+    PC6 ~ `planet_Cytotrophoblast` + `planet_Stromal` + `planet_Hofbauer` + `planet_Endothelial`,
+    PC7 ~ Cytotrophoblast + Hofbauer + Stromal + Endothelial + Neu + NK + Bcell + CD4T + CD8T + Mono,
+    PC7 ~ `planet_Cytotrophoblast` + `planet_Stromal` + `planet_Hofbauer` + `planet_Endothelial`,
+    PC8 ~ Cytotrophoblast + Hofbauer + Stromal + Endothelial + Neu + NK + Bcell + CD4T + CD8T + Mono,
+    PC8 ~ `planet_Cytotrophoblast` + `planet_Stromal` + `planet_Hofbauer` + `planet_Endothelial`,
+    PC9 ~ Cytotrophoblast + Hofbauer + Stromal + Endothelial + Neu + NK + Bcell + CD4T + CD8T + Mono,
+    PC9 ~ `planet_Cytotrophoblast` + `planet_Stromal` + `planet_Hofbauer` + `planet_Endothelial`,
+    PC10 ~ Cytotrophoblast + Hofbauer + Stromal + Endothelial + Neu + NK + Bcell + CD4T + CD8T + Mono,
+    PC10 ~ `planet_Cytotrophoblast` + `planet_Stromal` + `planet_Hofbauer` + `planet_Endothelial`
+  )
+```
+
+## Execute models
+vectorized
+```{r}
+res.xval <-
+  map(list.models, ~ xval.glm(
+    data = pd.x.x,
+    .x,
+    glm.family = gaussian,
+    folds = 10,
+    repeats = 1000, #normally 200, we used 1000
+    loss = NULL,
+    numCore = NULL,
+    plots = T,
+    gray = F,
+    seed = 5,
+    showConsoleOutput = T
+  ))
+#saveRDS(res.xval, here("results", "analytic", "xval_glm", "xval_glm_vectorized_proposed_analytic.rds"))
+#ggsave(here("results", "analytic", "figures", "figure_x_xval.glm.jpg"))
+#ggsave(here("results", "analytic", "figures", "figure_x_xval.glm.jpeg"), dpi=300)
+
+#res.xval$data
+res.xval$PC1$box.plot
+res.xval$PC2$box.plot
+res.xval$PC3$box.plot
+res.xval$PC4$box.plot
+res.xval$PC5$box.plot
+res.xval$PC6$box.plot
+res.xval$PC7$box.plot
+res.xval$PC8$box.plot
+res.xval$PC9$box.plot
+res.xval$PC10$box.plot
+
+res.xval$PC1$RMSEP$PC <- "PC1 (15.4%)"
+res.xval$PC2$RMSEP$PC <- "PC2 (5.9%)"
+res.xval$PC3$RMSEP$PC <- "PC3 (3.5%)"
+res.xval$PC4$RMSEP$PC <- "PC4 (3.2%)"
+res.xval$PC5$RMSEP$PC <- "PC5 (2.0%)"
+res.xval$PC6$RMSEP$PC <- "PC6 (1.9%)"
+res.xval$PC7$RMSEP$PC <- "PC7 (1.6%)"
+res.xval$PC8$RMSEP$PC <- "PC8 (1.4%)"
+res.xval$PC9$RMSEP$PC <- "PC9 (1.1%)"
+
+
+PC1 <- res.xval$PC1$RMSEP %>% mutate(Wins = ifelse(Model == 1, res.xval$PC1$wins[1], res.xval$PC1$wins[2]))
+PC2 <- res.xval$PC2$RMSEP %>% mutate(Wins = ifelse(Model == 1, res.xval$PC2$wins[1], res.xval$PC2$wins[2]))
+PC3 <- res.xval$PC3$RMSEP %>% mutate(Wins = ifelse(Model == 1, res.xval$PC3$wins[1], res.xval$PC3$wins[2]))
+PC4 <- res.xval$PC4$RMSEP %>% mutate(Wins = ifelse(Model == 1, res.xval$PC4$wins[1], res.xval$PC4$wins[2]))
+PC5 <- res.xval$PC5$RMSEP %>% mutate(Wins = ifelse(Model == 1, res.xval$PC5$wins[1], res.xval$PC5$wins[2]))
+PC6 <- res.xval$PC6$RMSEP %>% mutate(Wins = ifelse(Model == 1, res.xval$PC6$wins[1], res.xval$PC6$wins[2]))
+PC7 <- res.xval$PC7$RMSEP %>% mutate(Wins = ifelse(Model == 1, res.xval$PC7$wins[1], res.xval$PC7$wins[2]))
+PC8 <- res.xval$PC8$RMSEP %>% mutate(Wins = ifelse(Model == 1, res.xval$PC8$wins[1], res.xval$PC8$wins[2]))
+PC9 <- res.xval$PC9$RMSEP %>% mutate(Wins = ifelse(Model == 1, res.xval$PC9$wins[1], res.xval$PC9$wins[2]))
+
+PC <- bind_rows(PC1, PC2, PC3, PC4, PC5, PC6, PC7, PC8, PC9) %>%
+  mutate(Model = ifelse(Model == 1, "Expanded reference", "planet reference"))
+PC$Model <- factor(PC$Model)
+
+
+rmse_plot <- ggplot(data = PC, mapping = aes(x = PC, y = RMSEP, fill = Model)) +
+  # Boxplot for RMSE values grouped by PC and Model
+  geom_boxplot(position = position_dodge(width = 0.75), outlier.shape = NA, width = 0.7) +
+  # Add jittered points for individual RMSE values
+  geom_jitter(aes(color = Model), position = position_jitterdodge(jitter.width = 0.15, dodge.width = 0.75), size = 2, alpha = 0.5) +
+  theme_bw() +
+  # Annotate the number of wins at the top of each boxplot
+  stat_summary(aes(label = Wins), fun = max, geom = "text", 
+               position = position_dodge(width = 0.75), vjust = -1, size = 3.5, color = "black") +
+  # Customize the theme for better visualization
+  theme_minimal() +
+  theme(legend.position = "top",
+        axis.text.x = element_text(angle = 30, hjust = 1)) +
+  labs(title = "RMSEP by Model and Principal Component", 
+       subtitle = "Wins of 1000 cross-validation models for each PC",
+       x = "Principal Component (PC)", 
+       y = "RMSEP",
+       fill = "Model", 
+       color = "Model") +
+  scale_fill_manual(values = c("lightblue", "salmon")) +  # Custom colors
+  scale_color_manual(values = c("lightblue", "salmon")) +
+  ylim(0,12)
+
+#ggsave(filename = here("results", "analytic", "xval_glm", "rmse_plot.tiff"), plot = rmse_plot)
+```
+
+Non-vectorized
+```{r, eval = F}
+res.xval.single <-
+  xval.glm(
+    data = pd.x.x,
+    models = models,
+    glm.family = gaussian,
+    folds = 10,
+    repeats = 100, #normally 200, we used 1000
+    loss = NULL,
+    numCore = NULL,
+    plots = T,
+    gray = F,
+    seed = 5,
+    showConsoleOutput = T
+  )
+#res.xval$data
+```
+
+Summary statistics
+```{r}
+#PC %>% group_by(PC) %>% group_by(Model) %>% tbl_summary()
+
+rmse <- res.xval$RMSEP
+write.xlsx(rmse, here("results", "analytic", "figures", "figure_x_xval.glm.xlsx"))
+rmse %>% group_by(Model) %>% summarise(Mean = mean(RMSEP), SD = sd(RMSEP))
+```
+
+Test for differences
+```{r}
+x1 <- rmse %>% filter(Model == 1) %>% pull(RMSEP)
+x2 <- rmse %>% filter(Model == 2) %>% pull(RMSEP)
+wilcox.test(x1, x2)
+t.test(x1, x2)
+```
+
+```{r}
+hist(x1)
+hist(x2)
+```
+
+Test for differences across models
+```{r}
+# If you want to use a non-parametric test (e.g., Wilcoxon rank-sum test) instead of t-test:
+test_results <- list()
+
+for (pc in unique(PC$PC)) {
+  data_subset <- subset(PC, PC == pc)
+  wilcox_test_result <- wilcox.test(RMSEP ~ Model, data = data_subset)
+  test_results[[pc]] <- wilcox_test_result
+}
+
+# View the results
+test_results
+```
+
+
+```{r}
+res.xval$box.plot
+res.xval$box.plot + scale_x_discrete(labels = c("Combined reference", "planet alone"))
+```
+
+```{r}
+rmse %>%
+  mutate(Model = ifelse(
+    Model == 1,
+    "Combined reference",
+    "planet alone"
+  ))
+
+
+p <- ggplot_build(res.xval$box.plot)
+p$data[[1]]$group[1] = "Combined reference"
+p$data[[1]]$group[2] = "planet alone"
+
+p$data[[2]] <- p$data[[2]] %>% mutate(group = ifelse(
+    group == 1,
+    "Combined reference",
+    "planet alone"
+  ))
+
+q <- ggplot_gtable(p)
+plot(q)
+```
+
+Some plotting of relative estimates 
+
+```{r}
+ggplot(dat = pd.x.x, mapping = aes(x = Cytotrophoblast, y = `characteristics:Cytotrophoblast`)) + geom_point()
+skim(pd.x.x$Cytotrophoblast)
+skim(pd.x.x$`characteristics:Cytotrophoblast`)
+
+z <- pd.x.x %>% dplyr::select(`characteristics:Syncytiotrophoblast`:nRBC) %>% skim
+z.x <- z %>% dplyr::select(!c(skim_type, n_missing, complete_rate, character.min, character.max, character.empty, character.n_unique, character.whitespace)) %>% filter(!skim_variable %in% c("characteristics:Basename", "characteristics:molecule")) %>% mutate(across(where(is.numeric), round, digits = 2))
+```

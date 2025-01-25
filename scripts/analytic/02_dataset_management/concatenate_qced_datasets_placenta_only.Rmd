@@ -1,0 +1,77 @@
+---
+title: "merge_datasets"
+author: "Kyle Abraham Campbell"
+date: "2023-11-13"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+library(here)
+library(tidyverse)
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Merge placental datasets only for clustering and outlier assessment
+
+```{r}
+# Common covariates between the datasets
+clin.covariates <- c("Sample.ID", "Sex", "CellType", "Case_ID", "Study", "Sentrix_ID", "Sentrix_Position"
+)
+
+kc <- readRDS(here("data", "analytic", "campbell", paste0("qc_beta_bmiq_campbell_2023-11-13.rda")))
+kc.pd <- readRDS(here("data", "analytic", "campbell", "pd_kc_harmonized_2023-11-13.rda"))
+colnames(kc) <- kc.pd$Sample.ID
+
+
+vy <- readRDS(here("data", "analytic", "yuan", paste0("beta_bmiq_qced_yuan_2023-11-14.rda")))
+vy.pd <- readRDS(here("data", "analytic", "yuan", paste0("beta_bmiq_qced_yuan_pd_2023-11-14.rda"))) %>% 
+  dplyr::select(clin.covariates)
+colnames(vy) <- vy.pd$Sample.ID
+```
+
+## Find common probes
+
+```{r}
+common.probes <- intersect(rownames(kc), rownames(vy))
+```
+
+
+## Drop contaminated Yuan samples, as in publication
+
+These samples have already been dropped from the Yuan data package
+```{r}
+vy.pd %>% filter(!Sample.ID %in% c('PM364_hofb_cs', 'PL293_v_R2', 'PM366_vc_R2', 'P131_hofb_cs', 'PM324_V4', 'PM324_V1', 'PM139_vc', 'PM77_vc'))
+vy <- vy[rownames(vy) %in% common.probes,]
+```
+
+Get mixtures (whole tissue samples)
+```{r}
+mixture.ids <- pd %>%
+  rownames_to_column(var = "Sentrix.ID") %>%
+  filter(CellType == "Villi") %>%
+  pull("Sample.ID")
+mixtures <- beta[,colnames(beta) %in% mixture.ids]
+```
+
+```{r}
+kc.pd.no.dup <- kc.pd #%>% filter(!Sample.ID %in% dup.drop.ids)
+kc.no.dup <- kc[rownames(kc) %in% common.probes,colnames(kc) %in% kc.pd.no.dup$Sample.ID]
+```
+
+
+## Concatenate placenta datasets
+```{r}
+head(vy)
+head(kc.pd.no.dup)
+```
+
+```{r}
+pd <- rbind(kc.pd.no.dup, vy.pd)
+beta <- cbind(kc.no.dup, vy)
+```
+
+```{r}
+saveRDS(pd, here("data", "analytic", "campbell_yuan_concat", "pd_2023-11-13.rda"))
+saveRDS(beta, here("data", "analytic", "campbell_yuan_concat", "beta_2023-11-13.rda"))
+```
+

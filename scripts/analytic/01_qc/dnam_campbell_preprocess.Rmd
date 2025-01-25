@@ -1,0 +1,189 @@
+---
+title: "preprocess"
+author: "Kyle Abraham Campbell"
+date: "11/09/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+# CRAN packages
+#library(GEOquery)
+library(BiocManager)
+library(corrplot)
+library(FactoMineR)
+library(factoextra)
+library(GGally)
+library(ggrepel)
+library(here)
+library(readxl)
+library(svd)
+library(tidymodels)
+library(tidyverse)
+library(viridis)
+
+# BioConductor packages
+library(illuminaio)
+library(IlluminaHumanMethylationEPICmanifest)
+library(IlluminaHumanMethylationEPICanno.ilm10b4.hg19)
+library(minfi)
+library(wateRmelon)
+
+# Github packages
+#devtools::install_github("hhhh5/ewastools@master")
+library(ewastools)
+#devtools::install_github('wvictor14/planet')
+library(planet)
+
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Minfi Preprocess KC data
+
+Read clinical metadata
+```{r}
+clin.pheno <- read_excel(here("data", "kc", "kc_clinical_metadata.xlsx"))
+colnames(clin.pheno) <- tolower(colnames(clin.pheno))
+```
+
+ga: gestational age (days)
+```{r}
+# code chunk to recode gestational age to ga (days)
+clin <- clin.pheno %>%
+  mutate(ga_weeks = str_extract(string = `gestational age`, pattern = "\\d\\d[w]")) %>%
+  mutate(ga_excess_days = str_extract(string = `gestational age`, pattern = "\\d[d]")) %>%
+  mutate(ga_weeks = substr(ga_weeks, 1, 2)) %>%
+  mutate(ga_excess_days = substr(ga_excess_days, 1, 1)) %>%
+  mutate(ga_excess_days = ifelse(is.na(ga_excess_days), 0, ga_excess_days)) %>%
+  mutate(across(c(ga_weeks, ga_excess_days), as.numeric)) %>%
+  mutate(ga = ga_weeks*7 + ga_excess_days) %>%
+  dplyr::select(ga, `gestational age`, ga_weeks, ga_excess_days, everything())
+```
+
+age
+race
+sex
+ever_smoker
+bw (kg)
+bl (cm)
+hc (cm)
+height (m)
+weight (kg)
+```{r}
+clin <- clin %>%
+  mutate(sex = factor(sex)) %>%
+  mutate(race = factor(`race/ethnicity`)) %>%
+  mutate(ever_smoker = ifelse(str_detect(`smoking status`, "never"), F, T)) %>%
+  mutate(across(c(`birth weight(kg)`, `birth length(cm)`, `head circumference(cm)`, `height(m)`, `weight(kg)`),
+                ~ as.numeric(str_extract(.x, pattern = "[\\d]+[.]*[\\d]+")))) %>%
+  dplyr::rename(c(Placenta = "sample", bw = `birth weight(kg)`, bl = `birth length(cm)`, hc = `head circumference(cm)`, height = `height(m)`, weight = `weight(kg)`))
+```
+
+```{r}
+clin.covariates = c("phenotype", "Placenta", "cleanup", "Sentrix_ID", "Sentrix_Position", "ga", "bw", "sex", "age", "race", "ever_smoker", "bmi")
+```
+
+Read sequencing phenotype data
+```{r}
+# Read in metadata sheet
+#pheno <- read_csv(here("data", "kc", "samplesheet_analysis_20210316.txt"))
+pheno <- read_csv(here("data", "kc", "samplesheet_analysis_20210316_kc72_vt_kc73_vt_swap.txt"))
+
+# Drop redundant column
+pheno <- pheno %>%
+  dplyr::select(!Sample_Group)
+```
+
+Create sample ID for merging
+```{r}
+pheno <- 
+  pheno %>%
+  mutate(Placenta = str_extract(`Sample ID`, "KC\\d\\d"))
+```
+
+Merge
+```{r}
+pheno <- left_join(pheno, clin, by = "Placenta")
+```
+
+```{r}
+# Get file paths to .idats
+pheno <- pheno %>%
+  mutate(Basename = paste0(here("data", "kc", "raw_data", "ImageData"), "/", Sentrix_ID, "/", Sentrix_ID, "_", Sentrix_Position))
+```
+
+Read in .idats
+```{r, eval = F}
+RGset <- read.metharray.exp(targets = pheno, extended = T, verbose = T)
+#saveRDS(RGset, file = here("data", paste0(Sys.Date(), "_kc_minfi_RGset.rda")))
+pd <- as.data.frame(pData(RGset))
+saveRDS(RGset, here("data", "analytic", "campbell", "RGset_20240701.rds"))
+```
+
+Load preloaded .Rdata
+```{r}
+RGset <- readRDS(here("data", "analytic", "campbell", "RGset_20240701.rds"))
+pd <- as.data.frame(pData(RGset))
+```
+
+Add or modify phenotype information
+```{r}
+pd <- pd %>%
+  mutate(Placenta = substr(Sample.ID, 1, 4)) %>%
+  mutate(across(Placenta, factor)) %>%
+  mutate(Sentrix_ID = factor(Sentrix_ID)) %>% 
+  mutate(bmi = weight/(height^2))
+
+pd.export <- pd %>% 
+  rownames_to_column(var = "Sample name") %>%
+  mutate(subject = substr(x = Sample.ID, start = 3, stop = 4)) %>%
+  mutate(title = gsub(pattern = "KC\\d\\d.", replacement = "", x = Sample.ID)) %>%
+  mutate(title = paste0(subject, "_", title)) %>%
+  mutate(title = gsub(pattern = "_\\d\\d_", replacement = "_", x = title)) %>%
+  mutate(organism = "human") %>%
+  mutate(idat_file_grn = paste0(`Sample name`, "_Grn.idat")) %>%
+  mutate(idat_file_red = paste0(`Sample name`, "_Red.idat")) %>%
+  mutate(tissue = "placenta") %>%
+  mutate(cell_type = phenotype) %>%
+  mutate(cell_type =
+           case_when(
+             cell_type == "VT" ~ "villous tissue",
+             cell_type == "FB" ~ "fibroblast",
+             cell_type == "HB" ~ "hofbauer",
+             cell_type == "ST" ~ "syncytiotrophoblast",
+             cell_type == "CT" ~ "cytotrophoblast")
+         ) %>%
+  mutate(chip = "GPL21145") %>%
+  mutate(mode.of.delivery = "C-section, low transverse") %>%
+  mutate(complications = "none") %>%
+  mutate(description = "we provide matched samples (within subject) of whole villous tissue or cell types enriched from that tissue; letters correspond to quandrant-based subsampling within the same placenta for a subset of 4 subjects") %>%
+  mutate(molecule = "genomic DNA") %>%
+  mutate(label = "Cy5 and Cy3") %>%
+  dplyr::select(`Sample name`,
+                title,
+                organism,
+                idat_file_grn,
+                idat_file_red,
+                subject,
+                tissue,
+                cell_type,
+                sex,
+                gestational.age,
+                mode.of.delivery,
+                complications,
+                molecule,
+                label,
+                description,
+                chip)
+#write.csv(pd.export, here("data", "kc", "raw_data", "GSE_pheno_data_20240702.csv"), row.names = F)
+  
+# Rerun with KC73-VT and KC72-VT Placenta labels swapped; already done at the file stage
+#pd.test <- pd %>%
+#  mutate( Placenta = ifelse(Sample.ID == "KC72_VT", "KC73", ifelse(Sample.ID == "KC73_VT", "KC72", Placenta)))
+```
+
+save phenotype dataframe
+```{r}
+#saveRDS(pd, here("data", paste0("phenotype_dataframe_pd_", Sys.Date())))
+```
+
+

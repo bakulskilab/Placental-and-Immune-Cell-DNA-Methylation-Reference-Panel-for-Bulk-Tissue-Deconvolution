@@ -1,0 +1,1103 @@
+---
+title: "10_compare_DNAm_cell_types"
+author: "Kyle Abraham Campbell"
+date: "1/11/2022"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+# CRAN packages
+library(corrplot)
+library(data.table)
+library(here)
+library(scattermore)
+library(GGally)
+library(ggpubr)
+library(ggrepel)
+library(here)
+library(limma)
+library(openxlsx)
+library(qqman)
+library(RColorBrewer)
+library(readxl)
+library(svd)
+library(tidymodels)
+library(tidyverse)
+library(UpSetR)
+library(viridis)
+
+options(ggrepel.max.overlaps = Inf)
+
+library(BiocManager)
+# BioConductor packages
+library(minfi)
+library(missMethyl)
+
+# Github packages
+#devtools::install_github("hhhh5/ewastools@master")
+library(ewastools)
+#devtools::install_github('wvictor14/planet')
+library(planet)
+
+# Source custom functions
+source(here("scripts", "analytic", "00_custom_helper_scripts", "10_custom_functions.R"))
+
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+### Load data
+
+Load the data
+```{r}
+placental.cell.type.names <- c("Cytotrophoblast", "Endothelial", "Hofbauer", "Stromal", "nRBC", "Syncytiotrophoblast")
+
+# Load concatenated 450k-overlap datasets
+pd <- readRDS(here("data", "analytic", "concat", "pd_2023-11-30.rda"))
+beta <- readRDS(here("data", "analytic", "concat", "beta_2023-11-16.rda"))
+
+# Subset to cell type fractions (remove whole tissue "Villi" samples)
+pd.celltypes <- pd %>% filter(CellType != "Villi")
+beta.celltypes <- beta[,colnames(beta) %in% pd.celltypes$Sample.ID]
+
+pickCompProbe.res <- readRDS(here::here("data", "analytic", "2024-10-21_pickCompProbes_res.rda"))
+
+fit <- readRDS(here("data", "analytic", "differential_dnam_res", "limma_model_fit_450k_all_cell_types_2024-01-11.rds"))
+rm(pd)
+rm(beta)
+```
+
+## Upset plots of differentially methylated hits
+
+```{r}
+coefficients <- colnames(fit$coefficients)
+
+hits.list <- map(coefficients, ~ topTable(fit = fit, coef = .x, number = Inf, confint = TRUE) %>% filter(adj.P.Val < 0.001 & abs(logFC) > 0.1) %>% rownames_to_column(var = "Probe"))
+names(hits.list) <- colnames(fit$coefficients)
+
+hits.probes <- map(hits.list, ~ .x$Probe)
+names(hits.probes) <- colnames(fit$coefficients)
+
+upset <- upset(fromList(hits.probes), order.by = "freq", decreasing = T, nsets = 12, nintersects = 20)
+upset
+
+#ggsave(dpi = 300, filename = here("results", "analytic", "differential_dnam", "dnam_hits_upset.jpg"))
+```
+
+```{r}
+upset.degree <- upset(fromList(hits.probes), order.by = "degree", decreasing = F, nsets = 12, nintersects = 24)
+upset.degree
+```
+
+```{r}
+upset(fromList(hits.probes), order.by = "freq", decreasing = T, nsets = 12, nintersects = 20, sets = c("Cytotrophoblast", "Endothelial", "Hofbauer", "Stromal", "Syncytiotrophoblast"))
+```
+
+```{r}
+upset(fromList(hits.probes), order.by = "degree", decreasing = F, nsets = 12, nintersects = 20, sets = c("Cytotrophoblast", "Endothelial", "Hofbauer", "Stromal", "Syncytiotrophoblast"))
+```
+
+### Intersection with pickCompProbes
+
+```{r}
+# Get all decon probe ids
+decon.probes.background <- pickCompProbe.res$coefEsts %>% rownames
+
+# Get background
+hits.probes.background <- map(hits.list, ~ .x %>% filter(Probe %in% decon.probes.background) %>% pull(Probe))
+names(hits.probes.background) <- colnames(fit$coefficients)
+
+# Original
+#hits.probes <- map(hits.list, ~ .x$Probe)
+#names(hits.probes) <- colnames(fit$coefficients)
+
+deconvolution.probes <- pickCompProbe.res$probeList
+#names <- names(deconvolution.probes) 
+names(deconvolution.probes) <- c("BCell_ref", "CD4T_ref", "CD8T_ref", "Cytotrophoblast_ref", "Endothelial_ref", "Hofbauer_ref", "Monocyte_ref", "Neutrophil_ref", "NaturalKiller_ref", "nRBC_ref", "Stromal_ref", "Syncytiotrophoblast_ref")
+
+hits.probes.decon <- c(hits.probes.background, deconvolution.probes)
+
+# Analytic
+bg <- upset(fromList(hits.probes.background), order.by = "freq", decreasing = T, nsets = 24, nintersects = 40, text.scale = 1)
+bg
+
+ # tiff(filename = here("results", "analytic", "differential_dnam", "deconvolution_probes_bg.tiff"),  width = 7, height = 7, units = "in", res = 300)
+ # bg
+ # dev.off()
+
+bg.placenta <- upset(fromList(hits.probes.background), sets = placental.cell.type.names[-5], order.by = "freq", decreasing = T, nsets = 24, nintersects = 60, text.scale = 1)
+bg.placenta
+
+bg.degree <- upset(fromList(hits.probes.background), order.by = "degree", decreasing = F, nsets = 24, nintersects = 40, text.scale = 1)
+bg.degree
+
+u <- upset(fromList(hits.probes.decon), order.by = "freq", decreasing = T, nsets = 24, nintersects = 40, text.scale = 0.8)
+u
+
+#hits.probes.background
+```
+
+
+## Differential methylation biological process enrichment testing
+
+Get top CpGs per contrast (all cell types)
+```{r}
+hits.list.all <- map(coefficients, ~ topTable(fit = fit, coef = .x, number = Inf, confint = TRUE) %>%
+                       #filter(adj.P.Val < 0.001 & abs(logFC) > 0.1) %>%
+                       rownames_to_column(var = "Probe"))
+names(hits.list.all) <- colnames(fit$coefficients)
+
+# Pull only probe ids for all hits
+hits.list.all.probe.ids <- map(hits.list.all, ~ as_tibble(.x) %>%
+  pull(Probe))
+```
+
+```{r}
+# Confirmed this was the same list derived for Cytotrophoblast as the previous chunk
+cpg.top.hits.for.gometh <- map(hits.list.all, ~ as_tibble(.x) %>%
+                                 filter(adj.P.Val < 0.001 & abs(logFC) > 0.1) %>%
+                                 arrange(desc(abs(t))) %>% # Arrange by descending absolute value of test statistic
+                                 slice_head(n = 10000) %>% # Pull top 10000
+                                 pull(Probe))
+```
+
+
+Annotation from GPL GEO entry
+```{r}
+anno <- read_tsv(file = here("data", "annotation", "GPL13534-11288_no_header_tsv.txt")) %>%
+  dplyr::rename(probe_id = ID)
+```
+
+## MethylGSA
+
+```{r}
+library(methylGSA)
+
+createMethylGSAVector <- function(df) {
+  df <- df %>% as.data.frame()
+  vector <- df$P.Value
+  names(vector) <- df$Probe
+  return(vector)
+}
+
+methylGSAVectors <- map(hits.list.all, ~ createMethylGSAVector(.x))
+```
+
+```{r}
+prepareAnno.input <- anno %>%
+  dplyr::select(probe_id, UCSC_RefGene_Name) %>%
+  mutate(Gene = str_split_i(string = UCSC_RefGene_Name, pattern = ";", i = 1)) %>%
+  dplyr::rename(CpG = probe_id) %>%
+  dplyr::select(!UCSC_RefGene_Name) %>%
+  as.data.frame()
+FullAnnot = prepareAnnot(prepareAnno.input) 
+```
+
+### Run GSEAPreranked
+
+Need to convert to EPIC or use prepareAnno on a CpG to gene mapping structure
+```{r, eval = F}
+
+# This didn't prevent pvalue limiting out at 1e-10, will NES instead
+options(eps = 0)
+getOption("eps")
+
+
+# Perform robust rank aggregation
+res.gsea.list <- map(methylGSAVectors, ~ methylRRA(cpg.pval = .x,
+                                              method = "GSEA", # Can set eps = 0 to calculate p-values less than 1e-10
+                                              group = "promoter1",
+                                              minsize = 20,
+                                              maxsize = 500,
+                                              FullAnnot = FullAnnot,
+                                              GS.type = "GO")
+)
+#saveRDS(res.gsea.list, here("data", "methylGSA_promoter1_output.rds"))
+
+```
+```{r}
+res.gsea.list <- readRDS(here("data", "methylGSA_promoter1_output.rds"))
+```
+
+```{r}
+head(res.gsea.list$Cytotrophoblast)
+```
+
+
+### Export results
+Export all differential methylation enrichment results as a single table, dim of 190080 by 10 vars
+```{r export_supp_table_bp_methylGSA_pathways_large}
+#res.gsea.list$Cytotrophoblast$
+
+# Losing the following columns relative to the original analysis: ONTOLOGY, DIFFERENTIALLY_METHYLATED_GENES
+  
+methylGSA.results.bp <-
+  map(res.gsea.list, ~ .x %>%
+        rownames_to_column(var = "TERM_ID") %>%
+        dplyr::rename(
+          P_VALUE = pvalue,
+          FDR_ADJ_P_VALUE = padj,
+          PATHWAY_SIZE = Size,
+          DIFFERENTIALLY_METHYLATED_GENES_IN_PATHWAY = core_enrichment
+        ) %>%
+        dplyr::select(!leading_edge) %>%
+        arrange(FDR_ADJ_P_VALUE) %>%
+        mutate(ENRICHED = ifelse(
+          FDR_ADJ_P_VALUE < 0.01,
+          TRUE,
+          FALSE
+        )) %>%
+        mutate(across(.cols = where(is.numeric), ~ round(.x, digits = 3))) %>%
+        mutate(P_VALUE = ifelse(
+          P_VALUE == 0,
+          "< 0.001",
+          as.character(P_VALUE)
+        )) %>%
+        mutate(FDR_ADJ_P_VALUE = ifelse(
+          FDR_ADJ_P_VALUE == 0,
+          "< 0.001",
+          as.character(FDR_ADJ_P_VALUE)
+        )) %>%
+  dplyr::select(!ID)
+      )
+#View(methylGSA.results.bp$Cytotrophoblast)
+
+library(openxlsx)
+#write.xlsx(methylGSA.results.bp, here("results", "analytic", "differential_dnam", "res_all_methylGSA_enrichment_multiTab_promoter1_2024_10_13.xlsx"))
+
+methylGSA.results.bp.concat <- bind_rows(methylGSA.results.bp, .id = "CELL_TYPE")
+
+#write.csv(methylGSA.results.bp.concat, row.names = F, file = here("results", "analytic", "differential_dnam", "res_all_methylGSA_geneEnrichment_concat_2024_10_01.csv"))
+```
+
+Descriptives of pathways
+```{r}
+map(methylGSA.results.bp, ~ .x %>% filter(ENRICHED == TRUE))
+```
+
+
+### Upset plot of methylGSA hits
+
+Filter and format BP pathway results at FDR
+```{r}
+gometh.results.pathways <- map(methylGSA.results.bp, ~
+                                 .x %>%
+                                 filter(FDR_ADJ_P_VALUE < 0.01) %>%
+                                 pull(Description)) 
+names(gometh.results.pathways) <- names(methylGSA.results.bp)
+```
+
+```{r, eval = F}
+library(simplifyEnrichment)
+library(magick)
+library(gridtext)
+# Example clustering of GO terms based on gene overlap
+#simplifyGO(term_to_gene, method = "similarity")
+
+methylGSA.results.bp$Cytotrophoblast %>% colnames
+
+methylGSA.results.bp.x <- map(res.gsea.list, ~ .x %>%
+        rownames_to_column(var = "TERM_ID") %>%
+        dplyr::rename(
+          P_VALUE = pvalue,
+          FDR_ADJ_P_VALUE = padj,
+          PATHWAY_SIZE = Size,
+          DIFFERENTIALLY_METHYLATED_GENES_IN_PATHWAY = core_enrichment
+        ) %>%
+        dplyr::select(!leading_edge) %>%
+        arrange(FDR_ADJ_P_VALUE))
+
+# gometh.results.termIDs <- map(methylGSA.results.bp, ~
+#                                  .x %>%
+#                                  filter(FDR_ADJ_P_VALUE < 0.001) %>%
+#                                  pull(TERM_ID))
+# names(gometh.results.termIDs) <- names(methylGSA.results.bp)
+
+gometh.results.termIDs <- map(methylGSA.results.bp.x, ~
+                                 .x %>%
+                                 filter(FDR_ADJ_P_VALUE < 0.001) %>%
+                                 dplyr::select(TERM_ID, FDR_ADJ_P_VALUE))
+names(gometh.results.termIDs) <- names(methylGSA.results.bp)
+
+#simplifyGOFromMultipleLists(gometh.results.termIDs, ont = "BP", padj_column = "FDR_ADJ_P_VALUE", padj_cutoff = 0.001)
+
+
+# tiff(filename = here("results", "analytic", "differential_dnam", "simplifyGO.tiff"),  width = 7, height = 7, units = "in", res = 300)
+# simplifyGOFromMultipleLists(gometh.results.termIDs, ont = "BP", padj_column = "FDR_ADJ_P_VALUE", padj_cutoff = 0.001)
+# dev.off()
+```
+
+```{r, eval = F}
+placenta.termIDs <- gometh.results.termIDs[1:5]
+
+
+# tiff(filename = here("results", "analytic", "differential_dnam", "simplifyGO_placenta.tiff"),  width = 7, height = 7, units = "in", res = 300)
+# simplifyGOFromMultipleLists(placenta.termIDs, ont = "BP", padj_column = "FDR_ADJ_P_VALUE", padj_cutoff = 0.001)
+# dev.off()
+```
+
+
+```{r}
+upset(data = fromList(gometh.results.pathways), nsets = 12, nintersects = 40, order.by = "freq")
+upset(data = fromList(gometh.results.pathways), nsets = 12, nintersects = 12, order.by = "degree", decreasing = F)
+```
+
+```{r, eval = F}
+tiff(
+    file = here("results", "analytic", "differential_dnam", "top_methylGSA_upset_01.tiff"),
+    width=7,
+    height=7,
+    units = "in",
+    res = 300
+    )
+upset(data = fromList(gometh.results.pathways), nsets = 12, nintersects = 40, order.by = "freq")
+dev.off()
+```
+
+```{r}
+fromList_dm <- function (input) {
+  # Same as original fromList()...
+  elements <- unique(unlist(input))
+  data <- unlist(lapply(input, function(x) {
+      x <- as.vector(match(elements, x))
+      }))
+  data[is.na(data)] <- as.integer(0)
+  data[data != 0] <- as.integer(1)
+  data <- data.frame(matrix(data, ncol = length(input), byrow = F))
+  data <- data[which(rowSums(data) != 0), ]
+  names(data) <- names(input)
+  # ... Except now it conserves your original value names!
+  row.names(data) <- elements
+  return(data)
+}
+
+test <- fromList_dm((gometh.results.pathways))
+```
+
+Use these as common differentiators of cell type or ignore
+```{r}
+get_intersect_members(test, names(methylGSA.results.bp)) %>% rownames_to_column(var = "term") %>% pull(term)
+```
+
+
+```{r}
+get_intersect_members(test, c("Cytotrophoblast")) %>% rownames_to_column(var = "term") %>% pull(term)
+```
+
+```{r}
+get_intersect_members(test, c("Syncytiotrophoblast")) %>% rownames_to_column(var = "term") %>% pull(term)
+```
+
+
+```{r}
+get_intersect_members(test, c("Cytotrophoblast", "Syncytiotrophoblast")) %>% rownames_to_column(var = "term") %>% pull(term)
+```
+
+
+```{r}
+get_intersect_members(test, c("Endothelial")) %>% rownames_to_column(var = "term") %>% pull(term)
+get_intersect_members(test, c("Hofbauer")) %>% rownames_to_column(var = "term") %>% pull(term)
+get_intersect_members(test, c("Stromal")) %>% rownames_to_column(var = "term") %>% pull(term)
+```
+
+
+```{r}
+get_intersect_members(test, c("Cytotrophoblast", "Syncytiotrophoblast", "Hofbauer", "Stromal", 
+"Endothelial")) %>% rownames_to_column(var = "term") %>% pull(term)
+
+get_intersect_members(test, c("Neutrophil", "NaturalKiller", "BCell", "CD4T", 
+"CD8T", "Monocyte")) %>% rownames_to_column(var = "term") %>% pull(term)
+
+c("Cytotrophoblast", "Syncytiotrophoblast", "Hofbauer", "Stromal", 
+"Endothelial", "Neutrophil", "NaturalKiller", "BCell", "CD4T", 
+"CD8T", "Monocyte", "nRBC")
+```
+
+
+### Heatmap of biological processes with clustering by tissue
+
+```{r}
+methylGSA.results.bp.numeric <-
+  map(res.gsea.list, ~ .x %>%
+        rownames_to_column(var = "TERM_ID") %>%
+        dplyr::rename(
+          P_VALUE = pvalue,
+          FDR_ADJ_P_VALUE = padj,
+          PATHWAY_SIZE = Size,
+          DIFFERENTIALLY_METHYLATED_GENES_IN_PATHWAY = core_enrichment
+        ) %>%
+        dplyr::select(!leading_edge) %>%
+        arrange(FDR_ADJ_P_VALUE) %>%
+        mutate(ENRICHED = ifelse(
+          FDR_ADJ_P_VALUE < 0.05,
+          TRUE,
+          FALSE
+        )) %>%
+        #mutate(logP = -log10(FDR_ADJ_P_VALUE))
+        mutate(logP = -log10(P_VALUE)) #%>%
+        #mutate(across(.cols = where(is.numeric), ~ round(.x, digits = 3)))
+      ) %>%
+  bind_rows(.id = "CELL_TYPE") %>%
+  # Filter out the 519 common pathways across all cell types at fdr = 0.05
+  # 242 at fdr = 0.01
+  filter(!Description %in% (get_intersect_members(test, names(methylGSA.results.bp)) %>% rownames_to_column(var = "term") %>% pull(term)))# %>%
+  # Filter out the 57 common placental cell type pathways at fdr = 0.05
+  # 0 at fdr = 0.01
+  #filter(!Description %in% (get_intersect_members(test, names(placental.cell.type.names)) %>% rownames_to_column(var = "term") %>% pull(term))) %>%
+  # 7 at fdr = 0.01
+  #filter(!Description %in% (get_intersect_members(test, c("BCell", "CD4T", "CD8T", "NaturalKiller", "Neutrophil", "Monocyte")) %>% rownames_to_column(var = "term") %>% pull(term)))
+
+# 519 common pathways across all cell types at fdr = 0.05
+# 242 at fdr = 0.01
+get_intersect_members(test, names(methylGSA.results.bp)) %>% rownames_to_column(var = "term") %>% pull(term) %>% length
+
+# 6 common immune cell pathways
+# 7 common immune cell pathways at fdr = 0.01
+get_intersect_members(test, c("BCell", "CD4T", "CD8T", "NaturalKiller", "Neutrophil", "Monocyte", "Hofbauer")) %>% rownames_to_column(var = "term") %>% pull(term) %>% length
+
+# top_ontologies_df_NES <- methylGSA.results.bp.numeric %>%
+#   group_by(CELL_TYPE) %>%
+#   drop_na() %>%
+#   arrange(desc(abs(NES))) %>% 
+#   slice_head(n = 10)
+
+# Only nRBC "maxes out" with the top 10 hits all being p < 1e-10
+top_ontologies_df_PVALUE_lessnRBC <- methylGSA.results.bp.numeric %>%
+  group_by(CELL_TYPE) %>%
+  #arrange(NES) %>%
+  arrange(P_VALUE) %>%
+  drop_na() %>% 
+  slice_head(n = 10) %>%
+  filter(CELL_TYPE != "nRBC")
+
+# Arrange nRBC by NES within p < 1e-10
+top_ontologies_df_nRBC <- methylGSA.results.bp.numeric %>%
+  filter(CELL_TYPE == "nRBC") %>%
+  filter(P_VALUE == 1e-10) %>%
+  arrange(desc(abs(NES))) %>%
+  #arrange(P_VALUE) %>%
+  drop_na() %>% 
+  slice_head(n = 10)
+  
+top_ontologies_df_PVALUE <- bind_rows(top_ontologies_df_PVALUE_lessnRBC, top_ontologies_df_nRBC)
+
+#top_ontologies_df$Description
+
+# After excluding ~519 common intersections across all cell types
+# 242 at fdr = 0.01
+pval <- methylGSA.results.bp.numeric %>%
+  filter(Description %in% top_ontologies_df_PVALUE$Description) %>%
+  dplyr::select(logP, Description, CELL_TYPE) %>%
+  pivot_wider(names_from = CELL_TYPE, values_from = logP) %>%
+  column_to_rownames(var = "Description") %>%
+  drop_na()
+dim(pval)
+pheatmap(pval, fontsize = 8)
+```
+
+Analytic ontologies
+```{r, eval = F}
+tiff(filename = here("results", "analytic", "differential_dnam", "gsea", "pheatmap_top_ontologies_no_common_intersection_01.tiff"), width = 7, height = 7, units = "in", res = 300)
+pheatmap(pval, fontsize = 8, main = "Top unique ontologies heatmap by -log10(p-value)")
+dev.off()
+```
+
+
+```{r}
+# pval_nes <- methylGSA.results.bp.numeric %>%
+#   filter(Description %in% top_ontologies_df_PVALUE$Description) %>%
+#   dplyr::select(NES, Description, CELL_TYPE) %>%
+#   pivot_wider(names_from = CELL_TYPE, values_from = NES) %>%
+#   column_to_rownames(var = "Description") %>%
+#   drop_na()
+# pheatmap(pval_nes)
+# 
+# 
+# nes <- methylGSA.results.bp.numeric %>%
+#   filter(Description %in% top_ontologies_df_PVALUE$Description) %>%
+#   dplyr::select(NES, Description, CELL_TYPE) %>%
+#   pivot_wider(names_from = CELL_TYPE, values_from = NES) %>%
+#   column_to_rownames(var = "Description") %>%
+#   drop_na()
+# pheatmap(nes)
+# 
+# nes_pval <- methylGSA.results.bp.numeric %>%
+#   filter(Description %in% top_ontologies_df_NES$Description) %>%
+#   dplyr::select(logP, Description, CELL_TYPE) %>%
+#   pivot_wider(names_from = CELL_TYPE, values_from = logP) %>%
+#   column_to_rownames(var = "Description") %>%
+#   drop_na()
+# pheatmap(nes_pval)
+
+#dim(x)
+#x
+
+#pheatmap(mat = x)
+```
+
+```{r}
+colnames(methylGSA.results.bp.numeric)
+```
+
+Try looking at just placenta; this gives us a similar amount of information as above
+```{r,eval = F}
+methylGSA.results.bp.numeric.placenta.only <-
+  methylGSA.results.bp.numeric %>%
+  filter(CELL_TYPE %in% placental.cell.type.names) %>%
+  filter(!Description %in% (get_intersect_members(test, names(placental.cell.type.names)) %>% rownames_to_column(var = "term") %>% pull(term)))
+
+# 57 pathways common to all placental cell types
+get_intersect_members(test, placental.cell.type.names) %>% rownames_to_column(var = "term") %>% pull(term)
+
+top_ontologies_df_PVALUE.placenta.only <- methylGSA.results.bp.numeric.placenta.only %>%
+  group_by(CELL_TYPE) %>%
+  arrange(P_VALUE) %>%
+  drop_na() %>% 
+  slice_head(n = 10)
+
+# After excluding 57 common intersections across all placental cell types
+pval.placenta.only <- methylGSA.results.bp.numeric.placenta.only %>%
+  filter(Description %in% top_ontologies_df_PVALUE.placenta.only$Description) %>%
+  dplyr::select(logP, Description, CELL_TYPE) %>%
+  pivot_wider(names_from = CELL_TYPE, values_from = logP) %>%
+  column_to_rownames(var = "Description") %>%
+  drop_na()
+dim(pval.placenta.only)
+
+pheatmap(pval.placenta.only, fontsize = 8)
+```
+
+
+## Export all differential methylation hits
+
+Export all differential methylation results as a single table, dim of 4421220 (368435 sites*12 cell types) + colheader on export
+```{r export_supp_table_large}
+res.all <-
+  map(coefficients, ~ topTable(fit = fit, coef = .x, number = Inf, confint = TRUE))
+  
+names(res.all) <- coefficients
+x <-
+  map(res.all, ~ .x %>%
+        arrange(desc(B)) %>%
+        mutate(differentially_methylated = ifelse(
+          adj.P.Val < 0.001 & abs(logFC) > 0.1,
+          TRUE,
+          FALSE
+        )) %>%
+        dplyr::rename(effect_size = logFC,
+               lower_95_confidence = CI.L,
+               upper_95_confidence = CI.R,
+               average_methylation_rate = AveExpr,
+               t_statistic = t,
+               p_value = P.Value,
+               fdr_adj_p_value = adj.P.Val,
+               B_statistic = B,
+               differentially_methylated = differentially_methylated
+               ) %>%
+        rownames_to_column(var = "probe_id") %>%
+        mutate(across(.cols = where(is.numeric), ~ round(.x, digits = 3))) %>%
+        mutate(p_value = ifelse(
+          p_value == 0,
+          "< 0.001",
+          p_value
+        )) %>%
+        mutate(fdr_adj_p_value = ifelse(
+          fdr_adj_p_value == 0,
+          "< 0.001",
+          fdr_adj_p_value
+        ))
+  )
+
+x.anno <-
+  map(x, ~ left_join(.x, anno) %>%
+  dplyr::select(c("probe_id", "effect_size", "average_methylation_rate", "fdr_adj_p_value", "differentially_methylated", "UCSC_RefGene_Name", "UCSC_RefGene_Accession", "UCSC_RefGene_Group", "UCSC_CpG_Islands_Name", "Relation_to_UCSC_CpG_Island", "Phantom", "DMR", "Enhancer", "HMM_Island", "Regulatory_Feature_Name", "Regulatory_Feature_Group", "DHS", "Probe_SNPs", "Probe_SNPs_10", "Random_Loci"))
+  )
+
+res.all.concat <- bind_rows(x, .id = "cell_type")
+#write.csv(res.all.concat, row.names = F, file = here("results", "analytic", "differential_dnam", "res_all_concat_2024_01_30.csv"))
+
+dim(res.all.concat)
+head(res.all.concat)
+
+cell.types.1 <- c("Cytotrophoblast", "Syncytiotrophoblast", "Hofbauer")
+res.all.concat.1 <- res.all.concat %>%
+  filter(cell_type %in% cell.types.1)
+write.csv(res.all.concat.1, row.names = F, file = here("results", "analytic", "differential_dnam", "res_all_concat_2024_01_30_part_1.csv"))
+
+cell.types.2 <- c("Stromal", "Endothelial", "Neutrophil")
+res.all.concat.2 <- res.all.concat %>%
+  filter(cell_type %in% cell.types.1)
+write.csv(res.all.concat.2, row.names = F, file = here("results", "analytic", "differential_dnam", "res_all_concat_2024_01_30_part_2.csv"))
+
+cell.types.3 <- c("NaturalKiller", "BCell", "CD4T")
+res.all.concat.3 <- res.all.concat %>%
+  filter(cell_type %in% cell.types.3)
+write.csv(res.all.concat.3, row.names = F, file = here("results", "analytic", "differential_dnam", "res_all_concat_2024_01_30_part_3.csv"))
+
+cell.types.4 <- c("CD8T", "Monocyte", "nRBC")
+res.all.concat.4 <- res.all.concat %>%
+  filter(cell_type %in% cell.types.4)
+write.csv(res.all.concat.2, row.names = F, file = here("results", "analytic", "differential_dnam", "res_all_concat_2024_01_30_part_4.csv"))
+```
+
+```{r data_load}
+#IlluminaHumanMethylationEPICanno.ilm10b4.hg19
+pd <- readRDS(here("data", "analytic", "concat", "pd_2023-11-30.rda"))
+beta <- readRDS(here("data", "analytic", "concat", "beta_2023-11-16.rda"))
+```
+
+```{r minfi_plot_cpg_example}
+plotCpg(dat = beta, cpg = "cg23757825", pheno = pd$CellType, type = "categorical", measure = "beta")
+```
+
+Format methylation and phenotype data for ggplot of Beta values by cell type
+```{r reformat_beta_matrix_and_pd_for_ggplot}
+# Get top 10,000 CpGs per contrast and subset to unique
+unique.top.cpgs <- cpg.top.hits.for.gometh %>%
+  bind_rows(.id = "cell_type") %>%
+  pivot_longer(cols = everything(), names_to = "cell_type", values_to = "probe_id") %>%
+  pull(probe_id) %>%
+  unique()
+
+# Subset to top CpGs
+beta.top.cpgs <- beta #beta[rownames(beta) %in% unique.top.cpgs,]
+
+# Reformat pd labels
+pd.dat <- pd %>%
+  mutate(CellType = ifelse(
+         CellType == "NK",
+         "NaturalKiller",
+         CellType)
+  ) %>%
+  mutate(CellType = ifelse(
+         CellType == "Mono",
+         "Monocyte",
+         CellType)
+         ) %>%
+    mutate(CellType = ifelse(
+         CellType == "Neu",
+         "Neutrophil",
+         CellType)
+         ) %>%
+  mutate(CellType = ifelse(
+         CellType == "Villi",
+         "Whole tissue",
+         CellType)
+  )
+
+# Reformat beta matrix and concatentae with phenotype dataframe
+beta.top.cpgs.t <-
+  t(beta.top.cpgs) %>%
+  as.data.frame() %>%
+  rownames_to_column(var = "Sample.ID")
+dat.beta <- left_join(pd.dat, beta.top.cpgs.t, by = "Sample.ID")
+dat.beta[1:5, 1:20]
+```
+
+
+cg23757825: EGFR Gene Body, Enhancer target
+```{r cytotrophoblast_cg23757825_EGFR_gene_body}
+plot.ct <- ggplot(dat = dat.beta,
+       mapping = aes(x = CellType, y = cg23757825)) +
+  geom_jitter(alpha = 0.15, width = 0.2) +
+  scale_y_continuous(labels = scales::percent) +
+  theme_bw() +
+  scale_y_continuous(labels = scales::percent) +
+  theme(axis.text.x = element_text(size = 8, angle = 45, vjust = .75, hjust=0.5)) +
+  xlab("Cell Type") +
+  ylab("Methylation rate") +
+  ggtitle(expression("Cytotrophoblast, cg23757825, "~italic("EGFR")~"body"))
+plot.ct
+```
+
+
+cg15227682, ERBB2, TS1500, somewhat differentiates st/ct some differences in scRNA-seq but sparse
+
+None of these differentiated ST from CT well
+cg11862144, SERPINB5
+cg16885093, CSHL1
+cg19103770, TFPI2
+cg07981495, CGA
+
+Syncytiotrophoblast only hit
+cg19368383, gene body of HPS1 protein part of biogenesis of lysosome-related organelles 
+```{r syncytiotrophoblast_cg19368383_HPS1}
+plot.st <- ggplot(dat = dat.beta,
+       mapping = aes(x = CellType, y = cg19368383)) +
+  geom_jitter(alpha = 0.1, width = 0.2) +
+  theme_bw() +
+  scale_y_continuous(labels = scales::percent) +
+  theme(axis.text.x = element_text(size = 8, angle = 45, vjust = .75, hjust=0.5)) +
+  xlab("Cell Type") +
+  ylab("Methylation rate") + 
+  ggtitle(expression("Syncytiotrophoblast, cg19368383, "~italic("HPS1")~"body"))
+plot.st
+```
+
+cg06713769, gene body, Hofbauer LYVE-1 hypomethylation, a Hofbauer marker https://pubmed.ncbi.nlm.nih.gov/18078989/
+
+```{r hofbauer_cg06713769_lyve1_gene_body}
+plot.hb <- ggplot(dat = dat.beta,
+       mapping = aes(x = CellType, y = cg06713769)) +
+  geom_jitter(alpha = 0.1, width = 0.2) +
+  theme_bw() +
+  scale_y_continuous(labels = scales::percent) +
+  theme(axis.text.x = element_text(size = 8, angle = 45, vjust = .75, hjust=0.5)) +
+  xlab("Cell Type") +
+  ylab("Methylation rate") + 
+  ggtitle(expression("Hofbauer,"~italic("LYVE-1")~"body"))
+plot.hb
+```
+
+Stromal cells, cg26574240, LMOD3 TSS200
+```{r stromal_cg26574240_lmod_tss200}
+plot.fb <- ggplot(dat = dat.beta,
+       mapping = aes(x = CellType, y = cg26574240)) +
+  geom_jitter(alpha = 0.1, width = 0.2) +
+  theme_bw() +
+  scale_y_continuous(labels = scales::percent) +
+  theme(axis.text.x = element_text(size = 8, angle = 45, vjust = .75, hjust=0.5)) +
+  xlab("Cell Type") +
+  ylab("Methylation rate") + 
+  ggtitle(expression("Stromal, cg26574240,"~italic("LMOD3")~"TSS200"))
+plot.fb
+```
+
+cg00097800, EPAS1, an hypoxia-inducible transcription factor, aka HIF2a	
+Body;1stExon
+```{r endothelial_cg00097800_EPAS1_aka_HIF2a}
+plot.en <- ggplot(dat = dat.beta,
+       mapping = aes(x = CellType, y = cg00097800)) +
+  geom_jitter(alpha = 0.1, width = 0.2) +
+  theme_bw() +
+  scale_y_continuous(labels = scales::percent) +
+  theme(axis.text.x = element_text(size = 8, angle = 45, vjust = .75, hjust=0.5)) +
+  xlab("Cell Type") +
+  ylab("Methylation rate") + 
+  ggtitle(expression("Endothelial, cg00097800,"~italic("EPAS1")~"exon one"))
+plot.en
+```
+
+cg08985539, POLN, gene body
+```{r nrbc_cg08985539_POLN_gene_body}
+plot.nrbc <- ggplot(dat = dat.beta,
+       mapping = aes(x = CellType, y = cg08985539)) +
+  geom_jitter(alpha = 0.1, width = 0.2) +
+  theme_bw() +
+  scale_y_continuous(labels = scales::percent) +
+  theme(axis.text.x = element_text(size = 8, angle = 45, vjust = .75, hjust=0.5)) +
+  xlab("Cell Type") +
+  ylab("Methylation rate") + 
+  ggtitle(expression("nRBC, cg08985539,"~italic("POLN")~"body"))
+plot.nrbc
+```
+
+```{r facet_prep}
+dat.facet <- dat.beta %>%
+  dplyr::select(CellType, cg23757825, cg00097800, cg06713769, cg26574240, cg19368383, cg08985539) %>%
+  pivot_longer(cols = contains("cg"), names_to = "Locus", values_to = "Methylation rate")
+```
+
+```{r figure_scatterplots}
+ggplot(dat = dat.facet,
+       mapping = aes(x = CellType, y = `Methylation rate`)) +
+  geom_jitter(alpha = 0.1, width = 0.2) +
+  theme_bw() +
+  scale_y_continuous(labels = scales::percent) +
+  facet_wrap(facets = vars(Locus)) +
+  theme(axis.text.x = element_text(size = 6, angle = 60, vjust = .75, hjust=0.5)) +
+  xlab("Cell Type") +
+  ylab("Methylation rate") 
+#ggsave(here("results", "analytic", "differential_dnam", "top_cpgs_scatterplot.jpg"), dpi = 300)
+```
+
+```{r facet_prep_annotated}
+dat.facet.anno <- dat.facet %>%
+  mutate(Locus = case_when(
+    Locus == "cg23757825" ~ "cg23757825, EGFR body",
+    Locus == "cg00097800" ~ "cg00097800, HIF2a exon one",
+    Locus == "cg06713769" ~ "cg06713769, LYVE-1 body",
+    Locus == "cg26574240" ~ "cg26574240, LMOD3 TSS200",
+    Locus == "cg19368383" ~ "cg19368383, HPS1 body",
+    Locus == "cg08985539" ~ "cg08985539, POLN body"
+    )
+  ) %>%
+  mutate(Locus = factor(Locus, levels = c("cg23757825, EGFR body",
+                                          "cg00097800, HIF2a exon one",
+                                          "cg06713769, LYVE-1 body",
+                                          "cg26574240, LMOD3 TSS200",
+                                          "cg19368383, HPS1 body",
+                                          "cg08985539, POLN body")))
+```
+
+```{r}
+p <- ggplot(dat = dat.facet.anno,
+       mapping = aes(x = CellType, y = `Methylation rate`)) +
+  geom_jitter(alpha = 0.1, width = 0.2) +
+  theme_bw() +
+  scale_y_continuous(labels = scales::percent) +
+  facet_wrap(facets = vars(Locus)) +
+  theme(axis.text.x = element_text(size = 6, angle = 60, vjust = .5, hjust=0.5)) +
+  xlab("Cell Type") +
+  ylab("DNA Methylation Percentage") +
+  theme(strip.text = element_text(face = "italic"))
+
+p <- ggplot(dat = dat.facet.anno,
+       mapping = aes(x = CellType, y = `Methylation rate`)) +
+  geom_jitter(alpha = 0.1, width = 0.2) +
+  theme_bw() +
+  scale_y_continuous(labels = scales::percent) +
+  facet_wrap(facets = vars(Locus)) +
+  theme(axis.text.x = element_text(angle = 30, vjust = 0.5, hjust = 0.5)) +
+  xlab("Cell Type") +
+  ylab("DNA Methylation Percentage") +
+  theme(strip.text = element_text(face = "italic")) +
+  coord_flip()
+p
+#ggsave(here("results", "analytic", "differential_dnam", "top_cpgs_scatterplot_anno.jpg"), dpi = 300)
+```
+
+```{r}
+tiff(
+    file = here("results", "analytic", "differential_dnam", "top_cpgs_scatterplot_anno.tiff"),
+    width=7,
+    height=7,
+    res = 300,
+    units = "in"
+    )
+print(p)
+dev.off()
+```
+
+```{r, eval=FALSE}
+jpeg(
+    file = here("results", "analytic", "differential_dnam", "top_cpgs_scatterplot_anno.jpeg"),
+    width=8,
+    height=8,
+    units = "in",
+    res = 600
+    )
+print(p)
+dev.off()
+```
+
+
+
+
+
+cg01599904: SP1, a transcription factor for EGFR, interesting example where statistically significant but does not meet our 10% threshold
+```{r}
+ggplot(dat = dat.beta,
+       mapping = aes(x = CellType, y = cg01599904)) +
+  geom_boxplot() +
+  geom_jitter(alpha = 0.1, width = 0.2) +
+  theme_bw() +
+  theme(axis.text.x = element_text(size = 8, angle = 45, vjust = .75, hjust=0.5)) +
+  xlab("Cell Type") +
+  ylab("Methylation rate") + 
+  ggtitle("cg01599904")
+```
+
+### Differentially methylated hits overlap
+```{r helper_code}
+
+fromList_dm <- function (input) {
+  # Same as original fromList()...
+  elements <- unique(unlist(input))
+  data <- unlist(lapply(input, function(x) {
+      x <- as.vector(match(elements, x))
+      }))
+  data[is.na(data)] <- as.integer(0)
+  data[data != 0] <- as.integer(1)
+  data <- data.frame(matrix(data, ncol = length(input), byrow = F))
+  data <- data[which(rowSums(data) != 0), ]
+  names(data) <- names(input)
+  # ... Except now it conserves your original value names!
+  row.names(data) <- elements
+  return(data)
+  }
+
+# Binary table with colnames:
+test.list <- fromList_dm(hits.list.all.probe.ids)
+```
+
+Common across all
+```{r}
+get_intersect_members(test.list, colnames(fit$coefficients)) %>% rownames_to_column(var = "term") %>% pull(term)
+
+get_intersect_members(test.list, c("Cytotrophoblast", "Syncytiotrophoblast")) %>% rownames_to_column(var = "term") %>% pull(term)
+
+get_intersect_members(test.list, c("Syncytiotrophoblast")) %>% rownames_to_column(var = "term") %>% pull(term)
+st.only.probes <- get_intersect_members(test.list, c("Syncytiotrophoblast")) %>% rownames_to_column(var = "term") %>% pull(term)
+# View hits that were unique to ST
+#View(x.anno$Syncytiotrophoblast %>% filter(probe_id %in% st.only.probes))
+
+get_intersect_members(test.list, c("Endothelial")) %>% rownames_to_column(var = "term") %>% pull(term)
+en.only.probes <- get_intersect_members(test.list, c("Endothelial")) %>% rownames_to_column(var = "term") %>% pull(term)
+View(x.anno$Endothelial %>% filter(probe_id %in% en.only.probes))
+
+
+get_intersect_members(test.list, c("Hofbauer")) %>% rownames_to_column(var = "term") %>% pull(term)
+hb.only.probes <- get_intersect_members(test.list, c("Hofbauer")) %>% rownames_to_column(var = "term") %>% pull(term)
+#View(x.anno$Hofbauer %>% filter(probe_id %in% hb.only.probes))
+
+get_intersect_members(test.list, c("Cytotrophoblast")) %>% rownames_to_column(var = "term") %>% pull(term)
+
+get_intersect_members(test.list, c("Stromal")) %>% rownames_to_column(var = "term") %>% pull(term)
+fb.only.probes <- get_intersect_members(test.list, c("Stromal")) %>% rownames_to_column(var = "term") %>% pull(term)
+View(x.anno$Stromal %>% filter(probe_id %in% fb.only.probes))
+
+nrbc.only.probes <- get_intersect_members(test.list, c("nRBC")) %>% rownames_to_column(var = "term") %>% pull(term)
+View(x.anno$nRBC %>% filter(probe_id %in% nrbc.only.probes))
+```
+
+### Run GO with missMethyl, not used for final analysis
+Run GO with missMethyl::gometh()
+```{r, eval = F}
+cpgs.tested <- rownames(beta.celltypes)
+gometh.results <-
+  map(
+    cpg.top.hits.for.gometh,
+    ~ gometh(
+      sig.cpg = .x,
+      all.cpg = cpgs.tested,
+      collection = c("GO", "KEGG"),
+      plot.bias = FALSE,
+      array.type = "450K",
+      sig.genes = TRUE
+    )
+  )
+```
+
+Load gometh results
+```{r load_gometh_results}
+gometh.results <- readRDS(here("data", "2024-01-04gometh_hits_all_cell_types_by_test_statistic_beta_0.1_fdr_0.001.Rda"))
+
+#View(gometh.results$Cytotrophoblast %>% filter(ONTOLOGY == "BP"))
+#View(gometh.results$Endothelial %>% filter(ONTOLOGY == "BP"))
+#View(gometh.results$Hofbauer %>% filter(ONTOLOGY == "BP"))
+#View(gometh.results$Stromal %>% filter(ONTOLOGY == "BP"))
+#View(gometh.results$Syncytiotrophoblast %>% filter(ONTOLOGY == "BP"))
+```
+
+Export all differential methylation enrichment results as a single table, dim of 190080 by 10 vars
+```{r export_supp_table_bp_pathways_large}
+gometh.results.bp <-
+  map(gometh.results, ~ .x %>%
+        filter(ONTOLOGY == "BP") %>%
+        arrange(FDR) %>%
+        mutate(ENRICHED = ifelse(
+          FDR < 0.05,
+          TRUE,
+          FALSE
+        )) %>%
+        mutate(ONTOLOGY = ifelse(
+          ONTOLOGY == "BP",
+          "biological process",
+          ONTOLOGY
+        )) %>%
+        rownames_to_column(var = "TERM_ID") %>%
+        dplyr::rename(
+          P_VALUE = P.DE,
+          FDR_ADJ_P_VALUE = FDR,
+          PATHWAY_SIZE = N,
+          DIFFERENTIALLY_METHYLATED_GENES_IN_PATHWAY = DE,
+          DIFFERENTIALLY_METHYLATED_GENES = SigGenesInSet
+        ) %>%
+        mutate(across(.cols = where(is.numeric), ~ round(.x, digits = 3))) %>%
+        mutate(P_VALUE = ifelse(
+          P_VALUE == 0,
+          "< 0.001",
+          as.character(P_VALUE)
+        )) %>%
+        mutate(FDR_ADJ_P_VALUE = ifelse(
+          FDR_ADJ_P_VALUE == 0,
+          "< 0.001",
+          as.character(FDR_ADJ_P_VALUE)
+        ))
+      )
+#View(gometh.results.bp$Cytotrophoblast)
+
+gometh.results.bp.concat <- bind_rows(gometh.results.bp, .id = "CELL_TYPE")
+#write.csv(gometh.results.bp.concat, row.names = F, file = here("results", "analytic", "differential_dnam", "res_all_enrichment_concat_2024_02_01.csv"))
+```
+
+Filter and format BP pathway results at FDR < 0.05
+```{r}
+gometh.results.pathways <- map(gometh.results, ~ .x %>%
+                                 filter(ONTOLOGY == "BP") %>%
+                                 filter(FDR < 0.05) %>%
+                                 pull(TERM)) 
+names(gometh.results.pathways) <- colnames(fit$coefficients)
+```
+
+```{r}
+upset(data = fromList(gometh.results.pathways), nsets = 12, nintersects = 20)
+```
+
+```{r}
+upset(fromList(gometh.results.pathways), order.by = "degree", decreasing = T, nsets = 12, nintersects = 20)
+```
+
+Analytic for abstract/initial submission
+```{r}
+upset(fromList(gometh.results.pathways), order.by = "freq", nsets = 12, nintersects = 40)
+p <- upset(fromList(gometh.results.pathways), order.by = "freq", nsets = 12, nintersects = 40)
+```
+
+```{r, eval=FALSE}
+jpeg(
+    file = here("results", "analytic", "differential_dnam", "upset_enrich_bp.jpeg"),
+    width=8,
+    height=8,
+    units = "in",
+    res = 600
+    )
+print(p)
+dev.off()
+```
+
+```{r}
+fromList_dm <- function (input) {
+  # Same as original fromList()...
+  elements <- unique(unlist(input))
+  data <- unlist(lapply(input, function(x) {
+      x <- as.vector(match(elements, x))
+      }))
+  data[is.na(data)] <- as.integer(0)
+  data[data != 0] <- as.integer(1)
+  data <- data.frame(matrix(data, ncol = length(input), byrow = F))
+  data <- data[which(rowSums(data) != 0), ]
+  names(data) <- names(input)
+  # ... Except now it conserves your original value names!
+  row.names(data) <- elements
+  return(data)
+  }
+
+# Binary table with colnames:
+test.list <- fromList_dm(gometh.results.pathways)
+```
+
+Common across all
+```{r}
+get_intersect_members(test.list, colnames(fit$coefficients)) %>% rownames_to_column(var = "term") %>% pull(term)
+
+get_intersect_members(test.list, c("Cytotrophoblast", "Syncytiotrophoblast")) %>% rownames_to_column(var = "term") %>% pull(term)
+
+get_intersect_members(test.list, c("Endothelial")) %>% rownames_to_column(var = "term") %>% pull(term)
+get_intersect_members(test.list, c("Hofbauer")) %>% rownames_to_column(var = "term") %>% pull(term)
+get_intersect_members(test.list, c("Cytotrophoblast")) %>% rownames_to_column(var = "term") %>% pull(term)
+get_intersect_members(test.list, c("Stromal")) %>% rownames_to_column(var = "term") %>% pull(term)
+
+gometh.results$Hofbauer %>% filter(TERM %in% (get_intersect_members(test.list, c("Hofbauer")) %>% rownames_to_column(var = "term") %>% pull(term))) %>% View
+
+gometh.results$Cytotrophoblast %>% filter(TERM %in% (get_intersect_members(test.list, c("Cytotrophoblast")) %>% rownames_to_column(var = "term") %>% pull(term))) %>% View
+gometh.results$Syncytiotrophoblast %>% filter(TERM %in% (get_intersect_members(test.list, c("Syncytiotrophoblast")) %>% rownames_to_column(var = "term") %>% pull(term))) %>% View
+gometh.results$Stromal %>% filter(TERM %in% (get_intersect_members(test.list, c("Stromal")) %>% rownames_to_column(var = "term") %>% pull(term))) %>% View
+gometh.results$Endothelial %>% filter(TERM %in% (get_intersect_members(test.list, c("Endothelial")) %>% rownames_to_column(var = "term") %>% pull(term))) %>% View
+
+gometh.results$Syncytiotrophoblast %>% filter(ONTOLOGY == "BP", N > 10, FDR < 0.05) %>% filter(N < 500)
+```
+
+
+

@@ -1,0 +1,352 @@
+---
+title: "10_compare_DNAm_cell_types"
+author: "Kyle Abraham Campbell"
+date: "1/11/2022"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+# CRAN packages
+library(corrplot)
+library(data.table)
+library(here)
+library(scattermore)
+library(GGally)
+library(ggpubr)
+library(ggrepel)
+library(here)
+library(limma)
+library(openxlsx)
+library(qqman)
+library(RColorBrewer)
+library(readxl)
+library(svd)
+library(tidymodels)
+library(tidyverse)
+library(viridis)
+
+options(ggrepel.max.overlaps = Inf)
+
+library(BiocManager)
+# BioConductor packages
+library(minfi)
+library(missMethyl)
+
+# Github packages
+#devtools::install_github("hhhh5/ewastools@master")
+library(ewastools)
+#devtools::install_github('wvictor14/planet')
+library(planet)
+
+# Source custom functions
+source(here("scripts", "analytic", "00_custom_helper_scripts", "10_custom_functions.R"))
+
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+### Notes
+
+RStudio package updating issues related to My Documents directory permission denial: https://stackoverflow.com/questions/42807247/installing-package-cannot-open-file-permission-denied
+
+https://bmcbioinformatics.biomedcentral.com/articles/10.1186/1471-2105-11-587 Use of M-values instead of beta values
+https://www.ncbi.nlm.nih.gov/pmc/articles/PMC6449748/ Discussion of M-value and beta-value in DNAm differential methylation
+https://www.bioconductor.org/packages/release/workflows/vignettes/methylationArrayAnalysis/inst/doc/methylationArrayAnalysis.html#quality-control Bioconductor tutorial for DNAm microarray analysis
+
+### Load data
+
+Load the data
+```{r}
+# Load concatenated 450k-overlap datasets
+pd <- readRDS(here("data", "analytic", "concat", "pd_2023-11-30.rda"))
+beta <- readRDS(here("data", "analytic", "concat", "beta_2023-11-16.rda"))
+
+# Subset to cell type fractions (remove whole tissue "Villi" samples)
+pd.celltypes <- pd %>% filter(CellType != "Villi")
+beta.celltypes <- beta[,colnames(beta) %in% pd.celltypes$Sample.ID]
+
+pickCompProbe.res <- readRDS(here::here("data", "analytic", "2023-12-21_pickCompProbes_res.rda"))
+
+rm(pd)
+rm(beta)
+```
+
+Convert to M-values, not used for primary analysis
+```{r}
+mvalue.celltypes <- beta_value_to_m_value(beta.celltypes)
+```
+
+```{r}
+#table(pd.celltypes$CellType, pd.celltypes$Case_ID)
+#table(pd.celltypes$CellType)
+```
+
+## Limma differential methylation model
+
+Run limma model with all 11 cell type groups across all 4 data sources (nRBCs come from one data source w/ two different studies)
+```{r, eval = F}
+fit <- run_limma_model_450k_all_cell_types(expr = beta.celltypes, pd = pd.celltypes)
+#saveRDS(fit, file = here("data", "analytic", "differential_dnam_res", paste0("limma_model_fit_450k_all_cell_types_", Sys.Date(), ".rds")))
+```
+
+Run limma model with all 11 cell type groups across all 4 data sources (nRBCs come from one data source w/ two different studies) USING M-values
+```{r}
+#fit <- run_limma_model_450k_all_cell_types(expr = mvalue.celltypes, pd = pd.celltypes)
+```
+
+M-value cutoff of 0.5 corresponds to an approximate absolute beta value (% methylation) difference of 10%
+```{r}
+beta_threshold = 0.10
+logFC_threshold = 0.5
+FDR_threshold = 0.001
+```
+
+```{r, eval = F, include = F}
+res.ct <- graph_limma_model_scattermore("Cytotrophoblast",
+                       topTable(fit = fit.m, coef = "Cytotrophoblast", number = Inf, confint = TRUE),
+                       FDR_threshold = .001,
+                       logFC_threshold = 0.5,
+                       genes.of.interest = NULL)
+```
+
+```{r, eval = F}
+res.ct <- graph_limma_model_beta("Cytotrophoblast",
+                       topTable(fit = fit, coef = "Cytotrophoblast", number = Inf, confint = TRUE),
+                       FDR_threshold = .001,
+                       beta.diff_threshold = 0.1,
+                       genes.of.interest = NULL)
+```
+
+## Volcano plots
+Contrasts - original
+```{r}
+fit <- readRDS(here("data", "analytic", "differential_dnam_res", "limma_model_fit_450k_all_cell_types_2024-01-11.rds"))
+
+contrast.labels <- c("Cytotrophoblast", "Syncytiotrophoblast", "Hofbauer", "Stromal", 
+"Endothelial", "Neu", "NK", "Bcell", "CD4T", "CD8T", "Mono", 
+"nRBC")
+contrast.labels.placenta <- c("Cytotrophoblast", "Syncytiotrophoblast", "Hofbauer", "Stromal", 
+"Endothelial")
+```
+
+Contrasts - does relabelling work?
+```{r, eval = F}
+contrast.labels <- c("Cytotrophoblast", "Syncytiotrophoblast", "Hofbauer", "Stromal", 
+"Endothelial", "Neutrophils", "Natural Killer", "B cell", "CD4T", "CD8T", "Monocyte", 
+"Nucleated red blood cell")
+contrast.labels.placenta <- c("Cytotrophoblast", "Syncytiotrophoblast", "Hofbauer", "Stromal", "Endothelial")
+```
+
+
+https://www.biostars.org/p/339602/ Devon Ryan "The logFC of log2 transformed values are (approximately) the difference in the group means, which is indeed ~1.35 in your last example and ~7.3 the former example"
+
+```{r}
+res.ct <- graph_limma_model_scattermore_beta("Cytotrophoblast",
+                       topTable(fit = fit, coef = "Cytotrophoblast", number = Inf, confint = TRUE),
+                       FDR_threshold = FDR_threshold,
+                       beta_threshold = beta_threshold,
+                       genes.of.interest = NULL)
+
+res.en <- graph_limma_model_scattermore_beta("Endothelial",
+                       topTable(fit = fit, coef = "Endothelial", number = Inf, confint = TRUE),
+                       FDR_threshold = FDR_threshold,
+                       beta_threshold = beta_threshold,
+                       genes.of.interest = NULL)
+
+res.hb <- graph_limma_model_scattermore_beta("Hofbauer",
+                       topTable(fit = fit, coef = "Hofbauer", number = Inf, confint = TRUE),
+                       FDR_threshold = FDR_threshold,
+                       beta_threshold = beta_threshold,
+                       genes.of.interest = NULL)
+
+res.sr <- graph_limma_model_scattermore_beta("Stromal",
+                       topTable(fit = fit, coef = "Stromal", number = Inf, confint = TRUE),
+                       FDR_threshold = FDR_threshold,
+                       beta_threshold = beta_threshold,
+                       genes.of.interest = NULL)
+
+res.st <- graph_limma_model_scattermore_beta("Syncytiotrophoblast",
+                       topTable(fit = fit, coef = "Syncytiotrophoblast", number = Inf, confint = TRUE),
+                       FDR_threshold = FDR_threshold,
+                       beta_threshold = beta_threshold,
+                       genes.of.interest = NULL)
+
+# How mapped was previously set up to be used with following code
+mapped <- list(
+  "Cytotrophoblast" = res.ct,
+  "Endothelial" = res.en,
+  "Hofbauer" = res.hb,
+  "Stromal" = res.sr,
+  "Syncytiotrophoblast" = res.st
+)
+```
+
+Making presentable Volcano plots
+```{r}
+# Define a base_size variable for the font size for the publication multipanel
+#base.size <- 24
+base.size <- 10
+
+# Pull limits from each graph
+limits <- map(mapped, ~ get_coord_limits(.x[["volcano"]]))
+
+# Pull x-limits and convert to list of vectors
+x_limits <- map(limits, ~ unlist(.x["x"]))
+# Convert x-limits to vector
+x_limits <- unlist(x_limits)
+# Get x-min
+x_min <- min(x_limits)
+# Get x-max
+x_max <- max(x_limits)
+
+# Pull y-limits and convert to list of vectors
+y_limits <- map(limits, ~ unlist(.x["y"]))
+# Convert y-limits to vector
+y_limits <- unlist(y_limits)
+# Get y-min
+y_min <- min(y_limits)
+# Get y-max
+# y-max for ST is 1e-60, going to use 2nd largest value instead for graph readibility
+#y_sorted <- sort(y_limits)
+#y_max <- y_sorted[length(y_sorted)-3] %>% as.numeric
+y_max <- max(y_limits)
+
+names(mapped)
+
+contrast.labels <- names(mapped)
+
+# Get presentable volcanos
+# Add contrast title and set x and y limits without removing data points
+volcanos.ind <- map2(mapped, contrast.labels,
+                 ~ .x[["volcano"]] + ggtitle(.y) + coord_cartesian(xlim = c(x_min, x_max), ylim = c(y_min, y_max)))
+
+# Update geom_points, which are in 5/14 ratio to text font size
+#geom.size <- 5
+#update_geom_defaults("text_repel", list(size = geom.size))
+#update_geom_defaults("label", list(size = geom.size))
+
+volcanos <- map2(mapped, contrast.labels,
+                 ~ .x[["volcano"]] + ggtitle(.y) + coord_cartesian(xlim = c(x_min, x_max), ylim = c(y_min, y_max)) +
+                   # Trying to get hi rez export by # below
+                   #theme_bw(base_size = base.size) +
+                   theme(legend.position = "none") + ylab("-log10 q-value"))
+
+### WIP
+# Manually rest geom_label label.size geom_param for ggarrange - just move hyper and hypomethylated as plot subtitle
+
+#geom_label_size <- 9
+#volcanos$Cytotrophoblasts$layers[[6]]$aes_params$size <- geom_label_size
+#volcanos$Fibroblasts$layers[[6]]$aes_params$size <- geom_label_size
+#volcanos$`Hofbauer Cells`$layers[[6]]$aes_params$size <- geom_label_size
+#volcanos$Syncytiotrophoblasts$layers[[6]]$aes_params$size <- geom_label_size
+
+# From: https://github.com/slowkow/ggrepel/issues/84
+remove_geom <- function(ggplot2_object, geom_type) {
+  # Delete layers that match the requested type.
+  layers <- lapply(ggplot2_object$layers, function(x) {
+    if (class(x$geom)[1] == geom_type) {
+      NULL
+    } else {
+      x
+    }
+  })
+  # Delete the unwanted layers.
+  layers <- layers[!sapply(layers, is.null)]
+  ggplot2_object$layers <- layers
+  ggplot2_object
+}
+
+big.volcano.ct <- volcanos$Cytotrophoblast + theme(legend.position = "right", legend.text = element_text(size = 14))
+big.volcano.ct <- remove_geom(big.volcano.ct, "GeomTextRepel")
+
+# Custom function to save ggplots
+save_volcano_plot <- function(plot, filename) {
+  #print(plot)
+  ggsave(
+    here("results", "volcanos", paste0(filename, "_beta_volcano_", Sys.Date(), ".png"))
+  )
+}
+# Save volcanos
+#map2(volcanos.ind, names(mapped), ~ save_volcano_plot(.x, .y))
+```
+
+```{r}
+#map(volcanos.ind, print)
+```
+
+```{r}
+# Pull legend from a Volcano and make sure the title is removed
+volcano.legend <- get_legend(big.volcano.ct + theme(legend.title = element_blank()) + scale_colour_discrete(type = c("gray", "red"), labels = function(x) str_wrap(x, width = 38)) + guides(colour = guide_legend(override.aes = list(size=12))))
+#ggsave(filename = here("results", "volcanos", "big_legend_beta.png"), plot = volcano.legend)
+```
+
+```{r}
+panel <- ggarrange(volcanos[[1]], volcanos[[2]], volcanos[[3]], volcanos[[4]], volcanos[[5]], volcano.legend, ncol = 3, nrow = 2, labels = "auto")#, font.label = list(size = 36, face = "bold", color = "black"))
+#print(panel)
+# Works okay with theme_bw(base_size = 20) and font.label size = 24 in ggarrange
+#ggexport(panel, filename = here("results", "volcanos", paste0(Sys.Date(), "_volcano_multipanel.png")), width = 1920, height = 1080)
+#ggexport(panel, filename = here("results", "volcanos", paste0(Sys.Date(), "_beta_volcano_multipanel.png")), width = 1920, height = 1080)
+#ggexport(panel, filename = here("results", "volcanos", paste0(Sys.Date(), "_beta_volcano_multipanel.png")), res = 300, verbose = TRUE)
+```
+
+Finally a successful export. Required increasing image dimensions to 16x9in
+```{r, eval=FALSE}
+jpeg(
+    filename = here("results", "volcanos", paste0(Sys.Date(), "_beta_volcano_multipanel.jpeg")),
+    width=16,
+    height=9,
+    units="in",
+    res=300)
+print(panel)
+dev.off()
+```
+
+New attempt
+```{r}
+tiff(
+    filename = here("results", "volcanos", paste0(Sys.Date(), "_beta_volcano_multipanel.tiff")),
+    width=16,
+    height=9,
+    units="in",
+    res=300)
+print(panel)
+dev.off()
+```
+
+
+```{r, eval=FALSE}
+pdf(
+    here("results", "volcanos", paste0(Sys.Date(), "_beta_volcano_multipanel.pdf")),
+    width=16,
+    height=9
+    )
+print(panel)
+dev.off()
+```
+
+
+```{r}
+# Pull annotation
+anno.epic <- getAnnotation(IlluminaHumanMethylationEPICanno.ilm10b4.hg19)
+```
+
+```{r}
+# Pull limma results into a list
+limma_results <- list(
+  Cytotrophoblast = res.ct$res,
+  Endothelial = res.en$res,
+  Stromal = res.sr$res,
+  Hofbauer = res.hb$res,
+  Syncytiotrophoblast = res.st$res
+)
+```
+
+
+```{r}
+#saveRDS(limma_results, here("data", "kc", paste0("limma_beta_results_", Sys.Date(), ".rda")))
+limma_results <- readRDS(here("data", "kc", "limma_beta_results_2024-01-03.rda"))
+```
+
+Code fragment to annotate DNAm site results
+```{r}
+anno.epic[rownames(anno.epic) %in% limma_results$Cytotrophoblast$gene_symbol,] %>% head
+```

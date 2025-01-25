@@ -1,0 +1,408 @@
+---
+title: "deconvolution"
+author: "Kyle Abraham Campbell"
+date: "1/11/2022"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+# CRAN packages
+#library(GEOquery)
+library(BiocManager)
+library(corrplot)
+library(data.table)
+library(here)
+library(genefilter)
+library(GGally)
+library(ggpubr)
+library(ggrepel)
+library(gtsummary)
+library(here)
+library(openxlsx)
+library(pheatmap)
+library(qqman)
+library(RColorBrewer)
+library(readxl)
+library(skimr)
+library(svd)
+library(tidymodels)
+library(tidyverse)
+library(viridis)
+
+options(ggrepel.max.overlaps = Inf)
+
+# BioConductor packages
+library(EpiDISH)
+library(minfi)
+library(missMethyl)
+
+# Github packages
+#devtools::install_github("hhhh5/ewastools@master")
+library(ewastools)
+#devtools::install_github('wvictor14/planet')
+library(planet)
+
+# Source custom functions
+source(here("scripts", "analytic", "00_custom_helper_scripts", "10_custom_functions.R"))
+
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+### Notes
+
+https://bmcbioinformatics.biomedcentral.com/articles/10.1186/1471-2105-11-587 Use of M-values instead of beta values
+https://www.ncbi.nlm.nih.gov/pmc/articles/PMC6449748/ Discussion of M-value and beta-value in DNAm differential methylation
+https://www.bioconductor.org/packages/release/workflows/vignettes/methylationArrayAnalysis/inst/doc/methylationArrayAnalysis.html#quality-control Bioconductor tutorial for DNAm microarray analysis
+
+### Load data
+
+```{r}
+beta <- readRDS(here("data", "analytic", "concat", "beta_2023-11-16.rda"))
+pd <- readRDS(here("data", "analytic", "concat", "pd_2023-11-30.rda"))
+```
+
+Tabulate references by cell type
+```{r}
+table(pd$CellType)
+#table(pd$CellType, pd$Case_ID)
+```
+
+Get mixtures (whole tissue samples)
+```{r}
+mixture.ids <- pd %>%
+  rownames_to_column(var = "Sentrix.ID") %>%
+  filter(CellType == "Villi") %>%
+  pull("Sample.ID")
+mixtures <- beta[,colnames(beta) %in% mixture.ids]
+```
+
+KC63, KC65, KC66, KC67 only have whole tissue samples; subset out whole tissue samples and reset factor levels
+```{r}
+decon.ids <- pd %>% filter(CellType != "Villi") %>% pull(Sample.ID)
+other.cell.types <- pd %>% filter(Study %in% c("Bakulski", "de Goede", "Salas")) %>% pull(Sample.ID)
+
+keep.ids <- union(decon.ids, other.cell.types)
+rownames(pd) <- pd$Sample.ID
+
+# Drop from beta
+beta.celltypes <- beta[,(colnames(beta) %in% keep.ids)]
+
+# Drop phenotype data
+pd.celltypes <- pd[(rownames(pd) %in% keep.ids),]
+
+# Refactor
+pd.celltypes$CellType <- factor(pd.celltypes$CellType)
+pd.celltypes$Case_ID <- factor(pd.celltypes$Case_ID)
+
+table(pd.celltypes$CellType)
+
+#saveRDS(pd.celltypes, here("data", "analytic", "2023-11-30_pd_celltypes_450k.rda"))
+#saveRDS(beta.celltypes, here("data", "analytic", "2023-11-30_beta_celltypes_450k.rda"))
+```
+
+Implementing pickCompProbes locally
+```{r, eval = F}
+pickCompProbes.res <- pickCompProbes_kc(p = beta.celltypes, pd.fn = pd.celltypes, numProbes = 30)
+saveRDS(pickCompProbes.res, here("data", "analytic", "2024-10-21_pickCompProbes_res.rda"))
+#saveRDS(pickCompProbes.res, here("data", "analytic", "2023-12-21_pickCompProbes_res.rda"))
+
+#write.table(pickCompProbes.res$coefEsts, file = here("data", "analytic", paste0("top_720_site_by_pickCompProbes_", Sys.Date(), ".txt")))
+#write.table(pickCompProbes.res$coefEsts, file = here("data", "analytic", paste0("top_1100_site_by_pickCompProbes_", Sys.Date(), ".txt")))
+
+celltypes.ref <- pickCompProbes.res$coefEsts
+#1099 unique probes in the original default implementation on 2023-12-21
+# 879 with numProbes = 40
+#661 in the new numProbes = 30
+t <- pickCompProbes.res$probeList %>% unlist %>% unique
+
+saveRDS(celltypes.ref, here::here("data", "analytic", "2024-10-21-pickCompProbes_450k.rda"))
+#saveRDS(celltypes.ref, here::here("data", "analytic", "2023-12-21-pickCompProbes_450k.rda"))
+```
+
+Run with all probes, dim(beta)[1]; by default, minfi and its associated cord blood publication recommends filtering to results with  p < 1e-8, then 
+```{r, eval = F}
+pickCompProbes.all <- pickCompProbes_kc(p = beta.celltypes, pd.fn = pd.celltypes, numProbes = 368435)
+
+pickCompProbes.allProbes <- pickCompProbes_kc_all(p = beta.celltypes, pd.fn = pd.celltypes, numProbes = dim(beta.celltypes[1]))
+
+pickCompProbes.all <- list(
+    coefEsts = coefEsts,
+    compTable = compTable,
+    sampleMeans = pMeans,
+    probeList = probeList
+  )
+pickCompProbes.all$compTable
+
+#saveRDS(pickCompProbes.all, here::here("data", "analytic", "2024-10-16-pickCompProbes_allProbes_450k.rds"))
+```
+
+```{r}
+# Old default n = 50 probes
+#pickCompProbes.res <- readRDS(here::here("data", "analytic", "2023-12-21_pickCompProbes_res.rda"))
+#celltypes.ref <- readRDS(here::here("data", "analytic", "2023-12-21-pickCompProbes_450k.rda"))
+
+pickCompProbes.res <- readRDS(here::here("data", "analytic", "2024-10-21_pickCompProbes_res.rda"))
+celltypes.ref <- readRDS(here::here("data", "analytic", "2024-10-21-pickCompProbes_450k.rda"))
+```
+
+Look at individual probes; here is an example of hyper- and hypo-methylated Cytotrophoblast probes (from )
+```{r}
+# Look at top probes (hypo at top of list (1-49), hyper at bottom (50-100))
+#pickCompProbes.res$probeList$Cytotrophoblast %>% as.data.frame() %>% View
+
+plotCpg(dat = beta.celltypes, cpg = "cg25589945", pheno = pd.celltypes$CellType, type = "categorical", measure = "beta")
+plotCpg(dat = beta.celltypes, cpg = "cg23037777", pheno = pd.celltypes$CellType, type = "categorical", measure = "beta")
+plotCpg(dat = beta.celltypes, cpg = "cg05341539", pheno = pd.celltypes$CellType, type = "categorical", measure = "beta")
+plotCpg(dat = beta.celltypes, cpg = "cg01288184", pheno = pd.celltypes$CellType, type = "categorical", measure = "beta")
+```
+
+```{r}
+#pickCompProbes.res$probeList$Syncytiotrophoblast %>% as.data.frame() %>% View
+plotCpg(dat = beta, cpg = "cg19368383", pheno = pd$CellType, type = "categorical", measure = "beta")
+plotCpg(dat = beta, cpg = "cg18191867", pheno = pd$CellType, type = "categorical", measure = "beta")
+plotCpg(dat = beta, cpg = "cg14080475", pheno = pd$CellType, type = "categorical", measure = "beta")
+plotCpg(dat = beta, cpg = "cg09999194", pheno = pd$CellType, type = "categorical", measure = "beta")
+```
+
+```{r}
+#pickCompProbes.res$probeList$Syncytiotrophoblast %>% as.data.frame() %>% View
+plotCpg(dat = beta, cpg = "cg19368383", pheno = pd$CellType, type = "categorical", measure = "beta")
+plotCpg(dat = beta, cpg = "cg18191867", pheno = pd$CellType, type = "categorical", measure = "beta")
+plotCpg(dat = beta, cpg = "cg14080475", pheno = pd$CellType, type = "categorical", measure = "beta")
+plotCpg(dat = beta, cpg = "cg09999194", pheno = pd$CellType, type = "categorical", measure = "beta")
+```
+
+```{r, eval = F}
+gometh.results <-
+  map(
+    pickCompProbes.res$probeList,
+    ~ gometh(
+      sig.cpg = .x,
+      all.cpg = dimnames(beta.celltypes)[[1]],
+      collection = "GO",
+      plot.bias = FALSE,
+      array.type = "450K",
+      sig.genes = TRUE
+    )
+  )
+#saveRDS(gometh.results, here("results", "2022-11-06_pickCompProbes_gometh.rda"))
+```
+
+```{r, eval = F}
+gometh.results <- readRDS(here("results", "2022-11-06_pickCompProbes_gometh.rda"))
+```
+
+Filter go results function
+```{r, eval = F}
+filter_go_res <- function(res.go) {
+  return <-
+    res.go %>%
+      filter(ONTOLOGY == "BP") %>%
+      arrange(P.DE) #%>%
+      #filter(FDR < 0.10) %>%
+      #filter(N > 15) %>%
+      #filter(N <= 500)
+  return(return) 
+}
+go.res.filtered <- map(gometh.results, ~ filter_go_res(.x))
+```
+
+Cell type as colnames and probe names as rownames with beta values at i,j
+```{r}
+#mixtures.idx <- !(colnames(mixtures) %in% dup.drop.ids)
+
+#mixtures.no.dup <- mixtures[,mixtures.idx]
+
+colnames(mixtures)
+
+out.rpc <- epidish(beta.m = mixtures, ref.m = pickCompProbes.res$coefEsts, method = "RPC")
+
+pheatmap(t(out.rpc$estF))
+est <- out.rpc$estF %>% as.data.frame() %>% rownames_to_column(var = "Sample.ID")
+dat.est <- left_join(pd, est)
+
+# Export for validation analyses
+#saveRDS(dat.est, here("data", "analytic", paste0("villous_tissue_campbell_yuan_cell_type_estimates", Sys.Date(), ".rda")))
+
+colnames(dat.est)
+dat.est.epidish.gg <- dat.est %>%
+  pivot_longer(cols = c("Cytotrophoblast", "Endothelial", "Hofbauer", "Stromal", "Syncytiotrophoblast", "nRBC", "Bcell", "CD4T", "CD8T", "Endothelial", "Mono", "Neu", "NK"), names_to = "Cell_Type_Proportion", values_to = "Percentage")
+
+#x <- dat.est.epidish.gg$CellType %>% factor(labels = c("Whole tissue", "B cell", "CD4T", "CD8T", "Cytotrophoblast", 
+#"Endothelial", "Hofbauer", "Monocyte", "Neutrophil", "Natural Killer", 
+#"Nucleated red blood cell", "Stromal", "Syncytiotrophoblast"))
+```
+
+```{r}
+# Get mean and SD for cell type proportions
+x <- dat.est %>%
+  dplyr::select(c("Cytotrophoblast", "Endothelial", "Hofbauer", "Stromal", "Syncytiotrophoblast", "nRBC", "Bcell", "CD4T", "CD8T", "Endothelial", "Mono", "Neu", "NK"))
+
+means <- apply(x, MARGIN = 2, function(x) mean(x))
+sds <- apply(x, MARGIN = 2, function(x) sd(x))
+```
+
+```{r}
+colMeans(out.rpc$estF)
+```
+
+### Cell composition descriptives
+```{r}
+combined.estimates <- skim(out.rpc$estF)
+combined.estimates
+```
+
+```{r}
+ggplot(dat.est.epidish.gg %>% filter(CellType == "Villi"), mapping = aes(x = Sample.ID, y = Percentage, fill = Cell_Type_Proportion)) +
+  geom_bar(position = "fill", stat = "identity") +
+  facet_wrap(vars(Study), scales="free_x") +
+  theme(axis.title.x=element_blank(),
+        axis.text.x=element_blank(),
+        axis.ticks.x=element_blank()) +
+  scale_fill_manual(values=c('#fde725', '#c2df23', '#86d549', '#52c569', '#2ab07f', '#1e9b8a', '#25858e', '#2d708e', '#38588c', '#433e85', '#482173', '#440154'))
+```
+
+Update labels
+```{r}
+dat.est.epidish.gg %>%
+  mutate(Cell_Type_Proportion = factor(Cell_Type_Proportion))
+
+dat.est.epidish.gg$Cell_Type_Proportion <- factor(dat.est.epidish.gg$Cell_Type_Proportion, labels = c("Bcell", "CD4T", "CD8T", "Cytotrophoblast", "Endothelial", 
+"Hofbauer", "Monocyte", "Neutrophil", "NaturalKiller", "nRBC", "Stromal", "Syncytiotrophoblast"
+))
+```
+
+```{r}
+dat.est.epidish.gg.maternal.collapse <- dat.est.epidish.gg %>%
+  mutate(Cell_Type_Proportion = ifelse(Cell_Type_Proportion %in% c("Bcell", "CD4T", "CD8T", "Monocyte", "Neutrophil", "NaturalKiller"),
+                                       "Maternal Immune",
+                                       Cell_Type_Proportion)) %>%
+  dplyr::rename(`Cell Type` = CellType) %>%
+  mutate(Cell_Type_Proportion = factor(Cell_Type_Proportion))
+levels(dat.est.epidish.gg.maternal.collapse$Cell_Type_Proportion) <- c("nRBC", "Stromal", "Syncytiotrophoblast", "Cytotrophoblast", "Endothelial", "Hofbauer", "Maternal Immune")
+dat.est.epidish.gg.maternal.collapse <- dat.est.epidish.gg.maternal.collapse %>% dplyr::rename(`Cell Type Proportion` = Cell_Type_Proportion)
+
+stacked_bar <- ggplot(dat.est.epidish.gg.maternal.collapse %>% filter(`Cell Type` == "Villi"), mapping = aes(x = Sample.ID, y = Percentage, fill = `Cell Type Proportion`)) +
+  geom_bar(position = "fill", stat = "identity") +
+  scale_y_continuous(labels = label_percent()) +
+  scale_fill_brewer(palette = "Set1") + # or "Paired" for a more varied set
+  theme_bw() +
+  labs(title = "Estimated cell proportion for villi samples") +
+  #facet_wrap(vars(Study), scales="free_x") +
+  theme(axis.title.x=element_blank(),
+        axis.text.x=element_blank(),
+        axis.ticks.x=element_blank()) #+
+  #scale_fill_manual(values=c('#fde725', '#c2df23', '#86d549', '#52c569', '#2ab07f', '#1e9b8a', '#25858e', '#2d708e', '#38588c', '#433e85', '#482173', '#440154'))
+stacked_bar
+#ggsave(filename = here("results", "analytic", "deconvolution_reference", "stacked_villi_bar.tiff"), plot = stacked_bar, dpi = 300)
+```
+
+
+Look at discriminating rows heatmap averaged by cell type (from EpiDISH output)
+```{r}
+ref <- out.rpc$ref
+colnames(ref) <- c("Bcell", "CD4T", "CD8T", "Cytotrophoblast", "Endothelial", "Hofbauer", "Monocyte", "Neutrophil", "NaturalKiller", "nRBC", "Stromal", "Syncytiotrophoblast")
+discriminating.probes <- rownames(ref)
+length(discriminating.probes)
+# tiff(filename = here("results", "analytic", "deconvolution_reference", "deconvolution_probe_heatmap.tiff"), res = 300, height = 7, width = 7, units = "in")
+# pheatmap(ref, labels_row = T, show_rownames = F)
+# dev.off()
+
+pheatmap(ref, labels_row = T, show_rownames = F)
+```
+
+```{r, eval=FALSE}
+jpeg(
+    file = here("results", "analytic", "deconvolution_reference", "pickCompProbes_heatmap.jpeg"),
+    width=8,
+    height=8,
+    units = "in",
+    res = 600
+    )
+pheatmap(ref, labels_row = T, show_rownames = F)
+dev.off()
+```
+
+```{r}
+ggplot(dat.est.epidish.gg, mapping = aes(x = Cell_Type_Proportion, y = Percentage)) +
+  geom_jitter(alpha = 0.25) +
+  theme_bw() +
+  theme(axis.text.x = element_text(size = 8, angle = 45, vjust = .75, hjust=0.5)) +
+  xlab("Cell Type")
+```
+
+
+```{r, eval=FALSE}
+jpeg(
+    file = here("results", "analytic", "deconvolution_reference", "tissue_decon_estimates.jpeg"),
+    width=8,
+    height=8,
+    units = "in",
+    res = 600
+    )
+ggplot(dat.est.epidish.gg, mapping = aes(x = Cell_Type_Proportion, y = Percentage)) +
+  geom_jitter(alpha = 0.25) +
+  theme_bw() +
+  theme(axis.text.x = element_text(size = 8, angle = 45, vjust = 0.5, hjust=0.5)) +
+  xlab("Cell Type")
+dev.off()
+```
+
+```{r export_dnam_ref_table, eval = F}
+write.xlsx(ref %>% as.data.frame() %>% rownames_to_column(var = "probe_id"), file = here("results", "analytic", "deconvolution_reference", "deconvolution_ref_top30_2024-10-21.xlsx"))
+```
+
+Look at discriminating probes heatmap
+```{r}
+# Subset beta to discriminating probes
+beta.markers <- beta[(rownames(beta) %in% discriminating.probes),]
+anno_df <- data.frame("Cell_Type" = pd$CellType,
+                      "Study" = pd$Study)
+rownames(anno_df) <- pd$Sample.ID
+
+pheatmap(beta.markers, show_rownames = F)
+pheatmap <- pheatmap(beta.markers, show_rownames = F, annotation_col = anno_df, fontsize_col = 2)
+
+#save_pheatmap_pdf(pheatmap, here("results", "pickCompProbes50_heatmap.pdf"))
+```
+
+Look at discriminating probes heatmap, placenta only
+```{r}
+pd.placental <- pd %>% filter(Study %in% c("Campbell", "Yuan"))
+placental.ids <- pd.placental %>% pull(Sample.ID)
+anno_df <- data.frame("Cell_Type" = pd.placental$CellType,
+                      "Study" = pd.placental$Study)
+rownames(anno_df) <- pd.placental$Sample.ID
+
+# Subset beta to discriminating probes
+beta.markers.placental <- beta[(rownames(beta) %in% discriminating.probes),colnames(beta) %in% placental.ids]
+
+pheatmap(beta.markers, show_rownames = F)
+pheatmap <- pheatmap(beta.markers, show_rownames = F, annotation_col = anno_df, fontsize_col = 2)
+
+#save_pheatmap_pdf(pheatmap, here("results", "pickCompProbes50_heatmap_placental.pdf"))
+```
+
+```{r}
+out.cbs <- epidish(beta.m = mixtures, ref.m = pickCompProbes.res$coefEsts, method = "CBS")
+```
+
+```{r}
+colMeans(out.cbs$estF)
+```
+
+```{r}
+out.cp <- epidish(beta.m = mixtures, ref.m = pickCompProbes.res$coefEsts, method = "CP")
+```
+
+```{r}
+colMeans(out.cp$estF)
+```
+
+
+```{r, eval = F}
+ref <- read.csv(file = "G:/.shortcut-targets-by-id/0B5TU2UlL9eC0VmhGUzZWM05DdUE/Placenta_Cell_Types/DNA/manuscript/supp_tables/Supplementary Table 3.csv")
+save(ref, file = here("ref.rda"))
+load(file = here("ref.rda"))
+```
+

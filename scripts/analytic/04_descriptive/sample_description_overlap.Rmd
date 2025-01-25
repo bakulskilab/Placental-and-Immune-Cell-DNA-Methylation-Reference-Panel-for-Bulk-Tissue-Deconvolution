@@ -1,0 +1,156 @@
+---
+title: "Sample Description"
+author: "Kyle Abraham Campbell"
+date: '2022-08-31'
+output: html_document
+---
+
+```{r setup, include=FALSE}
+# CRAN packages
+#library(GEOquery)
+library(BiocManager)
+library(corrplot)
+library(data.table)
+library(here)
+library(FactoMineR)
+library(factoextra)
+library(GGally)
+library(ggpubr)
+library(ggrepel)
+library(gtsummary)
+library(here)
+library(openxlsx)
+library(qqman)
+library(RColorBrewer)
+library(readxl)
+library(svd)
+library(tidymodels)
+library(tidyverse)
+library(viridis)
+
+options(ggrepel.max.overlaps = Inf)
+
+# Github packages
+#devtools::install_github("hhhh5/ewastools@master")
+library(ewastools)
+#devtools::install_github('wvictor14/planet')
+library(planet)
+
+# Source custom functions
+source(here("scripts", "analytic", "custom_helper_scripts", "10_custom_functions.R"))
+
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+### Notes
+
+https://bmcbioinformatics.biomedcentral.com/articles/10.1186/1471-2105-11-587 Use of M-values instead of beta values
+https://www.ncbi.nlm.nih.gov/pmc/articles/PMC6449748/ Discussion of M-value and beta-value in DNAm differential methylation
+https://www.bioconductor.org/packages/release/workflows/vignettes/methylationArrayAnalysis/inst/doc/methylationArrayAnalysis.html#quality-control Bioconductor tutorial for DNAm microarray analysis
+
+### Load data
+
+Load the data
+```{r}
+pd <- readRDS(here("data", "analytic", "concat", "pd_2023-11-30.rda"))
+```
+
+Factorize the appropriate variables
+```{r}
+common.vars <- c("Sample.ID", "CellType", "Study", "Sex", "Case_ID", "Sentrix_ID", "Sentrix_Position")
+
+other.ids <- pd %>% filter(Study %in% c("Salas", "de Goede", "Bakulski")) %>% pull(Sample.ID)
+placenta.keep.ids <- readRDS(here("data", "analytic", "campbell_yuan_concat", "strict_keep_2023-11-15.rda"))
+keep.ids <- c(placenta.keep.ids, other.ids)
+#duplicate.drop.ids <- readRDS(here("data", "analytic", "dup_drop_ids_2022-11-01.rda"))
+#dropped.samples <- readRDS(here("data", "analytic", "ST_drop_ids_not_in_CT_cluster_.rda"))
+pd.descriptives <- pd %>%
+  filter(Sample.ID %in% keep.ids) %>%
+  dplyr::select(all_of(common.vars)) %>%
+  mutate(ArrayTypes = ifelse(
+    Study %in% c("Bakulski", "de Goede"),
+    "450k",
+    "EPIC"
+  )) %>%
+  mutate(across(c(CellType, Study, Sex, ArrayTypes), factor)) %>%
+  mutate(Method = case_when(
+    Study == "Bakulski" ~ "MACS",
+    Study == "de Goede" ~ "FACS",
+    Study == "Campbell" ~ "MACS",
+    Study == "Yuan" ~ "FACS",
+    Study == "Salas" ~ "FACS"
+  ))
+
+levels(pd.descriptives$Sex) <- c("Female", "Male")
+
+levels(pd.descriptives$CellType) <- c("B cell", "CD4T", "CD8T", "Cytotrophoblast", "Endothelial", 
+"Hofbauer", "Monocyte", "Neutrophil", "Natural Killer", "Nucleated red blood cell", "Stromal", "Syncytiotrophoblast", "Whole tissue"
+)
+
+
+#pd.descriptives$Study <- fct_recode(pd.descriptives$Study, "FlowSorted.CordBlood.450k" = "Bakulski", "FlowSorted.CordBlood.450k" = "de Goede")
+
+#pd.descriptives$Study <- factor(pd.descriptives$Study, levels = c("Campbell", "Yuan", "Salas", "FlowSorted.CordBlood.450k"))
+```
+
+```{r}
+tbl_summary_labels <-
+  list(
+      Sex ~ "Fetal Sex",
+      CellType ~ "Cell Type",
+      ArrayTypes ~ "Illumina Array Type",
+      Study ~ "Study",
+      Method ~ "Cell Separation Method"
+  )
+#tbl_summary_types <-
+#  list( 
+#    #R11DRINKN ~ "continuous",
+#    #R11DRINKD ~ "continuous",
+#    R11CESD ~ "continuous",
+#    R11CONDE ~ "continuous"
+#  )
+```
+
+```{r}
+#theme_gtsummary_compact(font_size = 20)
+patients <- pd.descriptives %>%
+  mutate(Study = factor(Study, levels = c("Campbell", "Yuan", "Salas", "Bakulski", "de Goede"))) %>%
+  dplyr::select(Sex, CellType, ArrayTypes, Study, Method) %>%
+  tbl_summary(
+    by = Study,
+    label = tbl_summary_labels#,
+    #type = tbl_summary_types
+    ) #%>%
+  #as_gt() %>%             # convert to gt table
+  #gt::gtsave(             # save table as image
+  #  filename = here("results", "descriptive", paste0(Sys.Date(), "combined__no_dup_patient_descriptives.png"))
+  #)
+patients
+```
+
+```{r, eval = F}
+patients %>% as_gt() %>% gt::gtsave(filename = here("results", "analytic", "descriptive", "table_one_20231211.docx"))
+```
+
+
+```{r, include = F, eval = F}
+library(flextable)
+patients %>%
+  as_flex_table() %>%
+  #save_as_docx(path = here("results", "descriptive", paste0(Sys.Date(), "combined__no_dup_dropped_patient_descriptives.docx")))
+  save_as_image(path = here("results", "descriptive", paste0(Sys.Date(), "combined__no_dup_dropped_patient_descriptives.docx")))
+```
+
+
+```{r}
+levels(pd$Case_ID)
+total.replicates <- pd %>% dplyr::select(CellType) %>% tbl_summary(label = CellType ~ "Cell type samples")
+```
+
+```{r, eval = F}
+tbl_merge(list(patients, unique.replicates, total.replicates), tab_spanner = c("**Study Participants**", "**Unique Biological Replicates**", "**Total Replicates**")) %>%
+  as_gt() %>%             # convert to gt table
+  gt::gtsave(             # save table as image
+    filename = here("results", "descriptive", paste0(Sys.Date(), "table.png"))
+  )
+```
