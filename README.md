@@ -1,4 +1,4 @@
-# placenta_cell_type_dna
+# Placental and Immune Cell DNA Methylation Reference Panel for Bulk Tissue Deconvolution
 
 Placental and Immune Cell DNA Methylation Reference Panel for Bulk Tissue Cell Composition Estimation in Epidemiological Studies
 
